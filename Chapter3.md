@@ -1,464 +1,414 @@
 # Splunk SPL + SPL2
 
-# Chapter 3 — Text Searching, Wildcards, and Regex
+# Chapter 3 — Text Searching, Wildcards, and Regular Expressions
 
-This chapter is important because text searching is one of the most common things you do during SOC investigations.
+## Introduction
 
-You will constantly need to answer questions such as:
+In Chapter 2, we learned how to build a search from an investigation question and how to use basic field conditions and pipeline stages.
 
-- Did the command line contain `powershell`?
-- Did the process name start with `win`?
-- Did the file name end with `.exe`?
-- Does a field contain a particular word?
-- Does a field match a specific pattern?
-- Can I search for several variations of the same command?
-- Do I need an exact value, a wildcard, or a regular expression?
-- Should I use `search`, `where`, `regex`, `match()`, `like()`, or `rex`?
+This chapter goes one step deeper:
 
-The goal of this chapter is **not to memorize a collection of operators**.
+> **When I know the field I want to search, how do I decide whether I need an exact value, a wildcard, a pattern, or a regular expression?**
 
-Instead, you will learn how Splunk represents each type of text-search requirement and how the same requirement is expressed in traditional SPL and SPL2.
+This distinction matters because Splunk has several different mechanisms for text matching, and **SPL and SPL2 do not use exactly the same syntax for every mechanism**.
 
-A very important rule for this chapter is:
+The main tools we will learn here are:
 
-> **Do not translate LogScale or KQL syntax directly into Splunk. Translate the investigation requirement into the native Splunk operation.**
+```text
+search
+where
+LIKE / like()
+regex
+match()
+rex
+CASE()
+TERM()
+IN
+```
+
+We will not repeat the basic meaning of `index`, `host`, `source`, `sourcetype`, `_raw`, or `_time` from Chapter 1, or the basic pipeline and Boolean concepts from Chapter 2. Instead, we will build directly on them.
 
 ---
 
-# 3.1 What Does "Text Search" Actually Mean?
+# 3.1 First Decide What Kind of Match You Need
 
-Suppose an event contains this command line:
+Suppose a field contains:
 
 ```text
 powershell.exe -NoProfile -ExecutionPolicy Bypass
 ```
 
-You might want to search for:
+There are several different questions you could ask.
+
+### Exact value
+
+> Is the field exactly `powershell.exe`?
+
+### Prefix pattern
+
+> Does the value begin with `powershell`?
+
+### Substring pattern
+
+> Does `powershell` occur anywhere in the value?
+
+### Whole-word pattern
+
+> Does `powershell` occur as a complete word?
+
+### Structured pattern
+
+> Does the value match a more complicated expression?
+
+These are different requirements, so the first step is to choose the matching mechanism rather than immediately writing regex.
+
+A useful decision process is:
 
 ```text
-powershell
+What do I know?
+      |
+      +-- Exact value ----------> field="value"
+      |
+      +-- Several values --------> IN (...)
+      |
+      +-- Simple wildcard -------> search wildcard *
+      |
+      +-- Expression pattern ----> LIKE / like()
+      |
+      +-- Complex pattern -------> regex / match()
 ```
-
-But there are several different questions you could ask.
-
-### Question 1
-
-Does the command line contain the text `powershell` anywhere?
-
-### Question 2
-
-Does the command line contain `powershell` as a complete word?
-
-### Question 3
-
-Does the command line start with `powershell`?
-
-### Question 4
-
-Does the command line end with `.exe`?
-
-### Question 5
-
-Does the command line match a more complicated pattern?
-
-### Question 6
-
-Does the field match one of several possible values?
-
-These are different search requirements.
-
-Therefore the first skill is:
-
-```text
-Investigation requirement
-        ↓
-Decide what kind of match is required
-        ↓
-Exact value?
-Wildcard?
-LIKE pattern?
-Regex?
-        ↓
-Choose the appropriate Splunk command/function
-```
-
-Splunk provides several mechanisms for these cases, and they are not interchangeable. The `search` command, `where` command, `regex` command, `rex` command, and functions such as `match()` and `like()` have different purposes.
 
 ---
 
-# 3.2 The Most Important Difference From the Previous Chapter
+# 3.2 A Critical Correction: SPL `regex` Is Not LogScale Regex Syntax
 
-In earlier examples, you may have seen a search such as:
+This is the example that often causes confusion when moving between platforms.
 
-### Traditional SPL
+In CrowdStrike LogScale, you may see a pattern written like:
+
+```text
+/powershell/i
+```
+
+Do **not** copy that syntax into Splunk.
+
+In traditional Splunk SPL, a regex expression is normally written as a quoted string:
 
 ```spl
-index=windows EventCode=4625
+| regex FileName="(?i)powershell"
 ```
 
-### SPL2
+This is valid SPL syntax according to the Splunk Enterprise 10.4 `regex` command reference.
 
-```spl2
-FROM windows
-WHERE EventCode=4625
+The syntax documented by Splunk is:
+
+```spl
+regex (<field>=<regex-expression> | <field>!=<regex-expression> | <regex-expression>)
 ```
 
-For text searching, however, you must understand that SPL and SPL2 have **multiple search mechanisms**.
+The regex is an unanchored PCRE expression and quotation marks are required. If no field is specified, the command matches against `_raw` by default.
 
-For example:
+**Very important:** the example
 
-### Traditional SPL
+```spl
+| regex FileName="(?i)powershell"
+```
+
+is valid. If it does not return anything, that does **not** automatically mean the regex syntax is wrong.
+
+The next question is:
+
+> **Does the current event actually contain a field called `FileName`?**
+
+If `FileName` does not exist or was not extracted for those events, the field-based regex cannot match it.
+
+As a diagnostic test, search the raw event instead:
 
 ```spl
 index=windows
-| search CommandLine=powershell*
+| regex "(?i)powershell"
 ```
 
-or:
+Because no field is specified, the `regex` command applies the expression to `_raw`.
+
+Or, when the field exists, use:
+
+```spl
+index=windows
+| regex FileName="(?i)powershell"
+```
+
+Splunk documents that the default field for the `regex` command is `_raw`, and that `field=<regex-expression>` keeps results whose field value matches the expression. [Official source: Splunk Enterprise 10.4 Search Reference — `regex` command.]
+
+---
+
+# 3.3 Traditional SPL: `regex` Filters Events
+
+The traditional SPL `regex` command is a **filtering command**.
+
+For example:
 
 ```spl
 index=windows
 | regex CommandLine="(?i)powershell"
 ```
 
-or:
+Think of it as:
 
-```spl
-index=windows
-| where match(CommandLine, "(?i)powershell")
+```text
+Event
+  |
+  +-- CommandLine matches regex? --> YES --> keep
+  |
+  +-- No --------------------------> remove
 ```
 
-### SPL2
+Splunk's documentation explicitly distinguishes `regex` from `rex`:
 
-```spl2
-search index=windows CommandLine="powershell*"
+```text
+regex
+  -> filter results using regex
+
+rex
+  -> extract fields or perform sed replacement
 ```
 
-or:
+That distinction should stay in your memory because the two commands look similar but perform different jobs.
+
+---
+
+# 3.4 SPL2: Use `match()` for Regex Filtering
+
+This is where we must separate SPL from SPL2 carefully.
+
+Current SPL2 documentation explains that regular expressions are used with the `rex` command and evaluation functions such as `match()` and `replace()`.
+
+For an expression-based regex filter, use `match()`:
 
 ```spl2
 FROM windows
 WHERE match(CommandLine, "(?i)powershell")
 ```
 
-These are not simply different spellings of one operation.
+Or, after another command has produced results:
 
-The first important decision is:
+```spl2
+FROM windows
+| where match(CommandLine, "(?i)powershell")
+```
 
-> **Am I performing a search predicate, an expression-based filter, a regex filter, or regex-based extraction?**
+`match()` returns `TRUE` when the regex finds a match against any substring of the string value and `FALSE` otherwise.
 
-That decision becomes increasingly important as your searches become more advanced.
+So the mental model becomes:
+
+```text
+Traditional SPL
+    regex
+      |
+      +-- regex filter
+
+SPL / SPL2 expression
+    match()
+      |
+      +-- TRUE / FALSE
+```
+
+The official SPL2 documentation specifically lists `match()` as a regular-expression function and allows it in `where` and the `WHERE` clause of `FROM`. [Official source: Splunk Enterprise 10.4 SPL2 Search Reference — comparison and conditional functions; SPL2 and regular expressions.]
 
 ---
 
-# 3.3 `search` — The Basic Text and Field-Value Search
+# 3.5 The Same Investigation in SPL and SPL2
 
-Traditional SPL has a `search` command.
+Suppose the requirement is:
 
-For example:
+> Find events whose `CommandLine` contains `powershell`, ignoring capitalization.
+
+### Traditional SPL
 
 ```spl
 index=windows
-| search CommandLine=powershell
+| regex CommandLine="(?i)powershell"
 ```
 
-At the beginning of the traditional SPL search, `search` is normally implied:
+### Traditional SPL using `where` + `match()`
 
 ```spl
-index=windows CommandLine=powershell
+index=windows
+| where match(CommandLine, "(?i)powershell")
 ```
 
-is effectively:
-
-```spl
-search index=windows CommandLine=powershell
-```
-
-Splunk documents that when a search pipeline starts with `search`, it retrieves matching events from indexes. When `search` occurs later in the pipeline, it filters the results that have already been produced.
-
-SPL2 makes an important syntax distinction: when you explicitly use the `search` command, you write the word `search`.
-
-### SPL
-
-```spl
-index=windows CommandLine=powershell
-```
-
-### SPL2
+### SPL2 using `WHERE`
 
 ```spl2
-search index=windows CommandLine=powershell
+FROM windows
+WHERE match(CommandLine, "(?i)powershell")
 ```
 
-This is one of the easiest places to accidentally mix the languages.
+### SPL2 using the pipeline `where`
+
+```spl2
+FROM windows
+| where match(CommandLine, "(?i)powershell")
+```
+
+The investigation requirement is identical. The important difference is the command language and the place where the expression is evaluated.
 
 ---
 
-# 3.4 Keyword Search vs Field-Value Search
+# 3.6 Why `(?i)`?
 
-A `search` can look for a general term:
+In Splunk regular expressions, `(?i)` is an inline modifier that requests case-insensitive matching.
 
-### SPL
-
-```spl
-index=windows powershell
-```
-
-This searches event content for the term.
-
-Or you can specify a field:
-
-```spl
-index=windows CommandLine=powershell
-```
-
-The second form says:
-
-> Search the `CommandLine` field for the value/pattern.
-
-SPL2 has the corresponding forms:
-
-```spl2
-search index=windows powershell
-```
-
-and:
-
-```spl2
-search index=windows CommandLine=powershell
-```
-
-The `search` command is therefore useful for ordinary keyword searching, phrases, field-value pairs, Boolean expressions, wildcards, and other search expressions.
-
----
-
-# 3.5 Exact Value Search
-
-Suppose the event contains:
+For example:
 
 ```text
-FileName=powershell.exe
+(?i)powershell
 ```
 
-and you want the exact value.
+can match:
 
-### SPL
+```text
+powershell
+PowerShell
+POWERSHELL
+```
+
+This is different from LogScale's slash-style notation:
+
+```text
+/powershell/i
+```
+
+For Splunk, keep the regex itself inside the quoted expression:
+
+```spl
+"(?i)powershell"
+```
+
+Splunk documents regular expressions as PCRE in the Splunk search language. [Official source: Splunk SPL2 Search Manual — About Splunk regular expressions.]
+
+---
+
+# 3.7 Unanchored Regex Means "Find It Anywhere"
+
+The Splunk `regex` command uses an **unanchored** regular expression unless you add anchors yourself.
+
+Therefore:
+
+```spl
+| regex CommandLine="(?i)powershell"
+```
+
+can match values such as:
+
+```text
+powershell.exe
+cmd.exe /c powershell
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+```
+
+You do not need `.*` around the word just to make it search through the field.
+
+This is an important correction to the common beginner pattern:
+
+```text
+.*powershell.*
+```
+
+For an ordinary unanchored regex search, that is unnecessary.
+
+Use the smallest pattern that expresses the requirement.
+
+The official `regex` command reference describes the expression as an unanchored regular expression, and the `match()` documentation likewise states that `match()` searches for the regex against any substring. [Official sources: Splunk Enterprise 10.4 `regex`; SPL2 comparison and conditional functions.]
+
+---
+
+# 3.8 Exact Value vs Substring Regex
+
+Compare these two searches.
+
+### Exact field value
 
 ```spl
 index=windows FileName="powershell.exe"
 ```
 
-### SPL2 — `search`
-
-```spl2
-search index=windows FileName="powershell.exe"
-```
-
-The concept is:
+This asks for the field value:
 
 ```text
-Field
-  ↓
-FileName
-
-Value
-  ↓
 powershell.exe
 ```
 
-Do not confuse exact value matching with regex matching.
-
-For example:
+### Regex substring search
 
 ```spl
-FileName="powershell.exe"
-```
-
-and:
-
-```spl
+index=windows
 | regex FileName="(?i)powershell"
 ```
 
-are different searches.
-
-The first is a field/value search.
-
-The second is a regex filter.
-
----
-
-# 3.6 Search Is Usually Case-Insensitive
-
-A very important current Splunk behavior is that the `search` command is case-insensitive for keyword searches and field-value values.
+This asks whether the regex finds `powershell` somewhere in the field.
 
 For example:
 
-```spl
-index=windows user=Administrator
+```text
+powershell.exe
 ```
 
-can match values with different capitalization such as:
+can satisfy both.
+
+But:
 
 ```text
-Administrator
-administrator
-ADMINISTRATOR
+powershell_ise.exe
 ```
 
-The field name itself is case-sensitive, so:
+can satisfy the regex while not satisfying the exact value comparison.
+
+So ask:
 
 ```text
-User
-```
+Do I know the complete value?
+        |
+       YES
+        |
+   Exact search
 
-and:
-
-```text
-user
-```
-
-are not necessarily the same field name.
-
-SPL2 follows the same behavior when you use its `search` command.
-
-This is different from expression-based comparisons such as `where`, which have different case-sensitivity behavior.
-
-This difference is important enough to remember:
-
-```text
-search
-    ↓
-case-insensitive field-value search
-
-where / expressions
-    ↓
-expression semantics apply
+Do I know only part of the value or a pattern?
+        |
+       YES
+        |
+   Wildcard / regex
 ```
 
 ---
 
-# 3.7 `CASE()` — Case-Sensitive Search
+# 3.9 Search Wildcards: `*`
 
-By default:
-
-```spl
-search host=DC01
-```
-
-is not a case-sensitive field-value search.
-
-If you specifically need a case-sensitive search, Splunk provides:
-
-```spl
-search host=CASE(DC01)
-```
-
-SPL2 also supports `CASE()` in the `search` command.
-
-Think:
-
-```text
-Normal search
-    ↓
-Case-insensitive
-
-CASE()
-    ↓
-Case-sensitive term/value matching
-```
-
-Do not confuse:
-
-```text
-CASE()
-```
-
-with:
-
-```text
-match()
-```
-
-`CASE()` is a `search` directive for case-sensitive term matching.
-
-`match()` is a regex evaluation function.
-
----
-
-# 3.8 `TERM()` — Searching a Complete Indexed Term
-
-Another advanced search feature that fits naturally into this chapter is:
-
-```text
-TERM()
-```
-
-This is especially useful when the term contains characters that Splunk treats as **minor segmenters** [minor segmenters: characters Splunk can use to split indexed text into smaller searchable terms], such as periods.
-
-An IP address is a classic example:
-
-```text
-127.0.0.1
-```
-
-A naive keyword search can be affected by how the value was segmented when indexed.
-
-For example:
-
-```spl
-search 127.0.0.1
-```
-
-can be interpreted as separate terms.
-
-When the value is a complete indexed term and is bounded appropriately, you can use:
-
-```spl
-search TERM(127.0.0.1)
-```
-
-The purpose is not to perform regex matching.
-
-It is to tell Splunk:
-
-> Treat the content inside `TERM()` as one indexed term.
-
-SPL2's `search` command also supports `TERM()`.
-
-This becomes useful when hunting for:
-
-```text
-IP addresses
-hostnames
-file names
-versions
-other values containing punctuation
-```
-
-Do not use `TERM()` as a replacement for regex. They solve different problems.
-
----
-
-# 3.9 Wildcards
-
-Wildcards are one of the most important areas where you must understand the difference between `search` and expression-based filtering.
-
-In search expressions, Splunk uses:
+In the `search` language, Splunk uses:
 
 ```text
 *
 ```
 
-to match zero or more characters.
+to match an unlimited number of characters.
 
 For example:
+
+### Traditional SPL
 
 ```spl
 index=windows FileName="powershell*"
 ```
 
-can match:
+### SPL2 `search`
+
+```spl2
+search index=windows FileName="powershell*"
+```
+
+This is a **search wildcard**, not regex.
+
+It can match values such as:
 
 ```text
 powershell.exe
@@ -466,25 +416,13 @@ powershell_ise.exe
 powershell7.exe
 ```
 
-Traditional SPL search:
-
-```spl
-index=windows FileName="powershell*"
-```
-
-SPL2 `search`:
-
-```spl2
-search index=windows FileName="powershell*"
-```
-
-The `*` is a **search wildcard** here. It is not the same thing as regex `.*`.
+Splunk's current SPL2 wildcard documentation explicitly states that the wildcard depends on the command: the `search` language uses `*`, while `where`/`WHERE` uses `LIKE` with `%` and `_`. [Official source: Splunk Enterprise SPL2 Search Manual — Wildcards.]
 
 ---
 
-# 3.10 Wildcard `*` vs Regex `.*`
+# 3.10 `*` vs `.*`
 
-This distinction is essential.
+This distinction is fundamental.
 
 ### Search wildcard
 
@@ -492,12 +430,7 @@ This distinction is essential.
 powershell*
 ```
 
-means:
-
-```text
-powershell
-followed by zero or more characters
-```
+belongs to the search language.
 
 ### Regex
 
@@ -505,85 +438,29 @@ followed by zero or more characters
 powershell.*
 ```
 
-means:
+belongs to the regex language.
+
+The regex form means:
 
 ```text
 powershell
-followed by any character
-zero or more times
++
+any character
++
+zero or more repetitions
 ```
 
-They look similar, but they belong to different matching systems.
-
-Think:
-
-```text
-Search syntax
-    *
-    ↓
-Wildcard
-
-Regex syntax
-    .*
-    ↓
-Any character, zero or more times
-```
-
-Do not automatically substitute one for the other.
+Do not use regex syntax when you are writing a normal `search` wildcard, and do not assume that a search wildcard is a regex.
 
 ---
 
-# 3.11 Important Wildcard Performance Rule
+# 3.11 SPL2 `LIKE`
 
-Splunk's current documentation recommends avoiding wildcard searches that begin with `*`.
+SPL2 adds an important expression-based pattern mechanism.
 
-For example:
+Inside `WHERE`, use `LIKE` rather than the `*` search wildcard.
 
-```spl
-CommandLine="*powershell"
-```
-
-can be expensive because Splunk may need to inspect many possible values before determining whether they end with `powershell`.
-
-A more specific search such as:
-
-```spl
-CommandLine="powershell*"
-```
-
-is generally more efficient when the requirement really is "starts with PowerShell."
-
-The same general principle applies to SPL2 `search`.
-
-Also avoid broad searches such as:
-
-```text
-*
-```
-
-when you already know more specific search criteria.
-
-The more specific your search is, the less unnecessary data Splunk needs to consider.
-
----
-
-# 3.12 SPL2 Introduces Another Wildcard Model
-
-This is one of the most important additions for this chapter.
-
-In SPL2, the wildcard depends on the command.
-
-For the SPL2 `search` command and many other commands, the traditional:
-
-```text
-*
-```
-
-wildcard is used.
-
-However, in an SPL2 `WHERE` clause and the `where` command, the recommended pattern-matching mechanism is `LIKE`.
-
-For example:
+Example:
 
 ```spl2
 FROM windows
@@ -596,9 +473,7 @@ Here:
 %
 ```
 
-means:
-
-> Match any number of characters.
+means zero or more characters.
 
 And:
 
@@ -606,574 +481,124 @@ And:
 _
 ```
 
-means:
+means exactly one character.
 
-> Match exactly one character.
-
-This gives us an important SPL2 distinction:
-
-```text
-SPL2 search
-    ↓
-*
-
-SPL2 WHERE / where
-    ↓
-LIKE
-    ↓
-%
-_
-```
-
----
-
-# 3.13 `LIKE` in SPL2
-
-The SPL2 expression:
+For example:
 
 ```spl2
 FROM windows
-WHERE FileName LIKE "powershell%"
+WHERE FileName LIKE "win%"
 ```
 
-performs pattern matching.
+matches values beginning with `win`.
 
-The same idea can be written with the `like()` function:
+This is different from:
+
+```spl2
+search index=windows FileName="win*"
+```
+
+because `search` and `WHERE` use different pattern semantics.
+
+Splunk's official SPL2 documentation explicitly states that the `WHERE` clause and `where` command use the `LIKE` function with `%` and `_`; `*` is used by other commands such as `search`. [Official source: Splunk Enterprise SPL2 Search Manual — Wildcards; Comparison and Conditional Functions.]
+
+---
+
+# 3.12 `LIKE` and `like()`
+
+The SPL2 predicate:
+
+```spl2
+FileName LIKE "powershell%"
+```
+
+and the function:
+
+```spl2
+like(FileName, "powershell%")
+```
+
+represent the same general pattern-matching concept.
+
+For example:
 
 ```spl2
 FROM windows
 WHERE like(FileName, "powershell%")
 ```
 
-The `LIKE` predicate and `like()` function are closely related.
-
-The wildcard meanings are:
-
-```text
-%  → zero or more characters
-_  → one character
-```
-
-Example:
-
-```spl2
-WHERE host LIKE "DC%"
-```
-
-could match:
-
-```text
-DC01
-DC02
-DC-Backup
-DCServer
-```
-
-`LIKE` is useful when you need wildcard pattern matching inside an expression.
+The official documentation notes that the `LIKE` predicate is similar to the `like()` function. [Official source: Splunk Enterprise SPL2 Search Reference — Comparison and Conditional Functions.]
 
 ---
 
-# 3.14 `LIKE` Is Case-Sensitive
+# 3.13 Regex Anchors: `^` and `$`
 
-This is an important difference from the normal `search` command.
+Now we move from "contains" to precise positions.
 
-Splunk documents the `like()` function as case-sensitive.
-
-So:
-
-```spl2
-WHERE like(FileName, "powershell%")
-```
-
-does not automatically mean:
-
-```text
-PowerShell.exe
-POWERSHELL.exe
-```
-
-will match.
-
-For case-insensitive matching, normalize the value first or use regex with an appropriate inline regex option when regex is the better tool.
-
-For example:
-
-```spl2
-FROM windows
-| eval lower_name=lower(FileName)
-| WHERE lower_name LIKE "powershell%"
-```
-
-This gives you a useful mental model:
-
-```text
-search
-    ↓
-normally case-insensitive
-
-like()
-LIKE
-    ↓
-case-sensitive
-
-match()
-regex
-    ↓
-regex semantics apply
-```
-
----
-
-# 3.15 Exact Match vs Wildcard vs Regex
-
-This is one of the most important decision points in the entire chapter.
-
-Suppose the requirement is:
-
-> Find `powershell.exe` exactly.
-
-Use:
-
-```spl
-FileName="powershell.exe"
-```
-
-or:
-
-```spl2
-search FileName="powershell.exe"
-```
-
-Suppose the requirement is:
-
-> Find values beginning with `powershell`.
-
-Use a search wildcard:
-
-```spl
-FileName="powershell*"
-```
-
-or SPL2:
-
-```spl2
-search FileName="powershell*"
-```
-
-Suppose the requirement is:
-
-> Use an expression wildcard pattern.
-
-Use SPL2:
-
-```spl2
-WHERE FileName LIKE "powershell%"
-```
-
-Suppose the requirement is:
-
-> Find `powershell` anywhere in the value with a regex.
-
-Use:
-
-```spl
-| regex FileName="(?i)powershell"
-```
-
-or:
-
-```spl
-| where match(FileName, "(?i)powershell")
-```
-
-The important thing is:
-
-```text
-Exact value
-    ↓
-field="value"
-
-Search wildcard
-    ↓
-field="value*"
-
-SPL2 LIKE
-    ↓
-field LIKE "value%"
-
-Regex
-    ↓
-match(field, "regex")
-or regex field="regex"
-```
-
----
-
-# 3.16 Regular Expressions
-
-Now we reach the most powerful pattern-matching mechanism in Splunk:
-
-```text
-Regular expressions
-```
-
-Splunk regular expressions use Perl-compatible regular expression behavior.
-
-Regex is used in several Splunk operations, including:
-
-```text
-regex
-rex
-match()
-replace()
-```
-
-and in ingestion/data-processing scenarios.
-
-Regex therefore matters not only for searches but also later when we learn:
-
-- field extraction
-- masking
-- routing
-- filtering
-- transformations
-- Ingest Processor
-- Edge Processor
-- `props.conf`
-- `transforms.conf`
-
----
-
-# 3.17 `regex` Command
-
-Traditional SPL has a dedicated command:
-
-```spl
-regex
-```
-
-Its purpose is to filter results based on a regular expression.
-
-For example:
-
-```spl
-index=windows
-| regex CommandLine="(?i)powershell"
-```
-
-This means:
-
-> Keep events where the `CommandLine` field matches the regex.
-
-The `regex` command can also use:
-
-```spl
-regex CommandLine!="(?i)powershell"
-```
-
-to keep results that do not match the regex.
-
-If you do not specify a field, `regex` operates on `_raw`:
-
-```spl
-index=windows
-| regex "(?i)powershell"
-```
-
-So:
-
-```text
-regex command
-    ↓
-Filter events using regex
-```
-
-This is different from `rex`.
-
----
-
-# 3.18 `regex` vs `rex`
-
-This distinction is extremely important.
-
-### `regex`
-
-Used to **filter** events.
-
-```spl
-index=windows
-| regex CommandLine="(?i)powershell"
-```
-
-Think:
-
-```text
-Does this event match my regex?
-        ↓
-YES → keep
-NO  → remove
-```
-
-### `rex`
-
-Used to **extract fields** from a regex pattern, or to perform sed-based replacement.
-
-Example:
-
-```spl
-index=windows
-| rex "user=(?<username>\S+) src_ip=(?<src_ip>\S+)"
-```
-
-Now Splunk creates fields such as:
-
-```text
-username
-src_ip
-```
-
-The regex is being used to create fields.
-
-Think:
-
-```text
-regex
-  ↓
-FILTER
-
-rex
-  ↓
-EXTRACT / REPLACE
-```
-
-Splunk's documentation explicitly distinguishes these two commands.
-
----
-
-# 3.19 `match()` — Regex Inside an Expression
-
-You can also use regex through the `match()` evaluation function.
-
-Traditional SPL:
-
-```spl
-index=windows
-| where match(CommandLine, "(?i)powershell")
-```
-
-SPL2:
-
-```spl2
-FROM windows
-WHERE match(CommandLine, "(?i)powershell")
-```
-
-`match()` returns a Boolean result [Boolean: a value that is either true or false].
-
-Conceptually:
-
-```text
-match(field, regex)
-        ↓
-Does the regex match?
-        ↓
-TRUE / FALSE
-```
-
-This is especially useful when the regex is part of a larger logical expression.
-
-For example:
-
-```spl
-index=windows
-| where match(CommandLine, "(?i)powershell") AND user="administrator"
-```
-
-SPL2:
-
-```spl2
-FROM windows
-WHERE match(CommandLine, "(?i)powershell")
-  AND user="administrator"
-```
-
----
-
-# 3.20 `match()` vs `regex`
-
-Both use regex, but their roles are different.
-
-### `regex`
-
-```spl
-| regex CommandLine="(?i)powershell"
-```
-
-is a dedicated filtering command.
-
-### `match()`
-
-```spl
-| where match(CommandLine, "(?i)powershell")
-```
-
-is a Boolean expression.
-
-That difference becomes particularly useful when you need to combine regex with other expressions.
-
----
-
-# 3.21 Case-Insensitive Regex
-
-A major difference from LogScale is that you should not simply copy:
-
-```text
-/powershell/i
-```
-
-into a Splunk query.
-
-In Splunk regex expressions, a common way to request case-insensitive matching is the inline regex modifier:
-
-```text
-(?i)
-```
-
-For example:
-
-```spl
-| regex CommandLine="(?i)powershell"
-```
-
-or:
-
-```spl
-| where match(CommandLine, "(?i)powershell")
-```
-
-This can match:
-
-```text
-powershell.exe
-PowerShell.exe
-POWERSHELL.EXE
-```
-
-So the basic Splunk mental model is:
-
-```text
-LogScale
-/powershell/i
-
-Splunk
-(?i)powershell
-```
-
-Do not mix the syntaxes.
-
----
-
-# 3.22 Regex Is Usually Unanchored Unless You Anchor It
-
-A regex such as:
-
-```text
-(?i)powershell
-```
-
-searches for that pattern within the string.
-
-So it can match:
-
-```text
-powershell.exe
-cmd.exe /c powershell
-mypowershellscript.exe
-```
-
-If you want the regex to describe the entire field, you need anchors.
-
-This leads to two critical regex characters:
-
-```text
-^
-$
-```
-
----
-
-# 3.23 `^` — Start of String
-
-The regex:
+## `^` — beginning of the string
 
 ```text
 ^powershell
 ```
 
-means:
+means that `powershell` must occur at the beginning.
 
-> The value must begin with `powershell`.
-
-Example:
+Traditional SPL:
 
 ```spl
 index=windows
 | regex CommandLine="(?i)^powershell"
 ```
 
-These can match:
+SPL2:
+
+```spl2
+FROM windows
+WHERE match(CommandLine, "(?i)^powershell")
+```
+
+This can match:
 
 ```text
 powershell.exe -enc AAAA
 powershell -nop
 ```
 
-But:
+but not:
 
 ```text
 cmd.exe /c powershell
 ```
 
-does not match because it begins with:
-
-```text
-cmd.exe
-```
-
-Mental model:
-
-```text
-^
-↓
-START HERE
-```
-
 ---
 
-# 3.24 `$` — End of String
-
-The regex:
+## `$` — end of the string
 
 ```text
 \.exe$
 ```
 
-means:
+means that the value must end with `.exe`.
 
-> The value must end with `.exe`.
-
-Example:
+Traditional SPL:
 
 ```spl
 index=windows
 | regex FileName="(?i)\.exe$"
 ```
 
-This matches:
+SPL2:
+
+```spl2
+FROM windows
+WHERE match(FileName, "(?i)\.exe$")
+```
+
+This can match:
 
 ```text
-powershell.exe
 cmd.exe
+powershell.exe
 chrome.exe
 ```
 
@@ -1183,60 +608,33 @@ but not:
 powershell.exe.bak
 ```
 
-because the string does not end at `.exe`.
-
-Mental model:
-
-```text
-$
-↓
-END HERE
-```
-
 ---
 
-# 3.25 Why Do We Escape `.`?
+# 3.14 Why `\.`?
 
-In regex:
-
-```text
-.
-```
-
-has a special meaning:
-
-> Match any character.
-
-For example:
+In regex, a period means:
 
 ```text
-a.b
+match any character except a line break
 ```
 
-could match:
-
-```text
-aab
-axb
-a1b
-a-b
-```
-
-But a Windows extension contains a literal period:
+So this:
 
 ```text
 .exe
 ```
 
-Therefore we write:
+is not precise enough when you mean a literal period.
+
+Use:
 
 ```text
 \.exe
 ```
 
-The backslash tells the regex engine that the period should be treated literally.
+The backslash escapes the period.
 
-So:
+Therefore:
 
 ```text
 \.exe$
@@ -1245,172 +643,140 @@ So:
 means:
 
 ```text
-literal .
+literal period
 +
 exe
 +
-end of string
+end of the string
 ```
+
+Splunk's regular-expression documentation specifically describes the need to escape special characters such as the period with a backslash. [Official source: Splunk SPL2 Search Manual — SPL2 and regular expressions.] 
 
 ---
 
-# 3.26 What Does `.*` Mean?
+# 3.15 Word Boundaries: `\b`
 
-You will see:
-
-```text
-.*
-```
-
-constantly in regex.
-
-It contains two pieces.
-
-```text
-.
-```
-
-means:
-
-> Any character.
-
-And:
-
-```text
-*
-```
-
-means:
-
-> Zero or more occurrences.
-
-Together:
-
-```text
-.*
-```
-
-means roughly:
-
-> Any number of characters.
-
-For example:
-
-```text
-powershell.*-enc
-```
-
-can match:
-
-```text
-powershell -enc AAAA
-powershell.exe -enc AAAA
-powershell -NoProfile -enc AAAA
-```
-
-because the `.*` allows content between:
+Suppose you search for:
 
 ```text
 powershell
 ```
 
-and:
+The regex can also match that text inside a larger value such as:
 
 ```text
--enc
+mypowershellscript.exe
 ```
 
-However, broad `.*` patterns can make a search less precise. Do not use it automatically.
-
----
-
-# 3.27 Building Regex From the Requirement
-
-Use this mental model:
-
-| Requirement | Regex |
-|---|---|
-| Find `powershell` anywhere | `powershell` |
-| Find `powershell` at the start | `^powershell` |
-| Find `.exe` at the end | `\.exe$` |
-| Find PowerShell then later `-enc` | `powershell.*-enc` |
-| Match a literal period | `\.` |
-| Find a complete word | `\bpowershell\b` |
-| Match one of two values | `(powershell|pwsh)` |
-
-The point is not to memorize the table.
-
-The point is:
-
-```text
-Requirement
-    ↓
-Describe the pattern
-    ↓
-Encode the pattern
-```
-
----
-
-# 3.28 Word Boundaries — `\b`
-
-Suppose:
-
-```text
-CommandLine=mypowershellscript.exe
-```
-
-and you search:
-
-```text
-powershell
-```
-
-the substring exists inside the larger word.
-
-If your requirement is:
+If the requirement is:
 
 > Find `powershell` as a complete word.
 
-you can use:
+Use:
 
 ```text
 \bpowershell\b
 ```
 
-For example:
+Traditional SPL:
 
 ```spl
 index=windows
 | regex CommandLine="(?i)\bpowershell\b"
 ```
 
-or:
+SPL2:
 
-```spl
-index=windows
-| where match(CommandLine, "(?i)\bpowershell\b")
+```spl2
+FROM windows
+WHERE match(CommandLine, "(?i)\bpowershell\b")
 ```
 
-The `\b` indicates a word boundary [word boundary: a position between a word character and a non-word character, according to the regex engine].
+The important idea is that `\b` identifies a word boundary [word boundary: a position separating a word character from a non-word character].
 
-Think:
-
-```text
-powershell.exe
-^^^^^^^^^^
-complete word before punctuation
-
-mypowershellscript.exe
-   ^^^^^^^^^^
-inside a larger word
-```
+This is useful when your requirement is about a complete word rather than an arbitrary substring.
 
 ---
 
-# 3.29 Multiple Alternatives With `|`
+# 3.16 Character Classes
 
-Inside a regex, the pipe character means OR.
+Square brackets define a character class.
+
+For example:
+
+```text
+[abc]
+```
+
+means one character from `a`, `b`, or `c`.
+
+A range can be written as:
+
+```text
+[0-9]
+```
+
+for one digit.
+
+Common regex character types include:
+
+```text
+\d    digit
+\w    word character
+\s    whitespace
+```
+
+These are building blocks rather than complete searches.
+
+For example:
+
+```text
+User\s*=\s*\w+
+```
+
+can describe text around a `User=` assignment while allowing variable whitespace.
+
+Do not start by memorizing every regex feature. Build from the characters you actually need.
+
+---
+
+# 3.17 Quantifiers: `*`, `+`, `?`
+
+Regex quantifiers control repetition.
+
+```text
+*
+```
+
+means zero or more.
+
+```text
++
+```
+
+means one or more.
+
+```text
+?
+```
+
+usually means zero or one when used as a quantifier.
+
+For example:
+
+```text
+-enc\s+
+```
+
+means `-enc` followed by one or more whitespace characters.
+
+This is more precise than using `.*` when the requirement is specifically whitespace.
+
+---
+
+# 3.18 Alternatives With `|`
+
+Inside regex, the pipe character means OR.
 
 For example:
 
@@ -1426,7 +792,7 @@ OR
 pwsh
 ```
 
-To require `.exe` after either alternative:
+To require `.exe` after either one:
 
 ```text
 (powershell|pwsh)\.exe
@@ -1439,13 +805,6 @@ index=windows
 | regex FileName="(?i)(powershell|pwsh)\.exe"
 ```
 
-Or with `match()`:
-
-```spl
-index=windows
-| where match(FileName, "(?i)(powershell|pwsh)\.exe")
-```
-
 SPL2:
 
 ```spl2
@@ -1453,307 +812,15 @@ FROM windows
 WHERE match(FileName, "(?i)(powershell|pwsh)\.exe")
 ```
 
----
+Because `|` is also Splunk's pipeline separator, keep a regex containing `|` inside the quoted regex expression.
 
-# 3.30 Why Parentheses Matter
-
-Compare:
-
-```text
-powershell|pwsh\.exe
-```
-
-with:
-
-```text
-(powershell|pwsh)\.exe
-```
-
-The second clearly means:
-
-```text
-either powershell
-OR pwsh
-
-then .exe
-```
-
-The first has different operator precedence [operator precedence: the rules that determine which part of an expression is interpreted together first].
-
-Therefore, when using alternatives, group them clearly:
-
-```text
-(powershell|pwsh)\.exe
-```
+Splunk's regular-expression documentation explicitly calls this out. [Official source: Splunk SPL2 Search Manual — SPL2 and regular expressions.]
 
 ---
 
-# 3.31 Character Classes
+# 3.19 `IN` Can Be Better Than Regex
 
-Square brackets define a character class.
-
-Examples:
-
-```text
-[abc]
-```
-
-means one character from:
-
-```text
-a
-b
-c
-```
-
-And:
-
-```text
-[0-9]
-```
-
-means one digit.
-
-You may also encounter:
-
-```text
-\d
-```
-
-for a digit,
-
-```text
-\w
-```
-
-for a word character, and:
-
-```text
-\s
-```
-
-for whitespace.
-
----
-
-# 3.32 Regex Quantifiers: `*`, `+`, `?`
-
-You should understand the basic difference.
-
-```text
-*
-```
-
-means:
-
-> Zero or more.
-
-```text
-+
-```
-
-means:
-
-> One or more.
-
-```text
-?
-```
-
-means:
-
-> Zero or one in the usual quantifier sense.
-
-For example:
-
-```text
--enc\s+
-```
-
-means:
-
-```text
--enc
-+
-one or more whitespace characters
-```
-
----
-
-# 3.33 Regex Is About Describing a Pattern
-
-This is the mindset you should develop.
-
-Don't think:
-
-> "I need to remember this strange syntax."
-
-Instead think:
-
-> "What pattern describes the activity I'm hunting?"
-
-For example:
-
-```text
-Requirement
-Find command lines containing powershell.
-
-Pattern
-powershell
-```
-
-```text
-Requirement
-Find the complete word powershell.
-
-Pattern
-\bpowershell\b
-```
-
-```text
-Requirement
-Find command lines starting with powershell.
-
-Pattern
-^powershell
-```
-
-```text
-Requirement
-Find values ending in .exe.
-
-Pattern
-\.exe$
-```
-
-```text
-Requirement
-Find powershell followed later by -enc.
-
-Pattern
-powershell.*-enc
-```
-
----
-
-# 3.34 A Real SOC Example — PowerShell Encoded Commands
-
-One common investigation is looking for PowerShell commands using encoded commands.
-
-A typical command line may contain:
-
-```text
-powershell.exe -enc AAAABBBBCCCC
-```
-
-Traditional SPL:
-
-```spl
-index=windows
-| regex CommandLine="(?i)powershell.*-(enc|encodedcommand)"
-```
-
-Or with `match()`:
-
-```spl
-index=windows
-| where match(CommandLine, "(?i)powershell.*-(enc|encodedcommand)")
-```
-
-SPL2:
-
-```spl2
-FROM windows
-WHERE match(CommandLine, "(?i)powershell.*-(enc|encodedcommand)")
-```
-
-This expresses:
-
-```text
-Process-related data
-      ↓
-PowerShell
-      ↓
-Encoded-command indicator
-```
-
----
-
-# 3.35 Be Careful With Broad Regex
-
-A regex such as:
-
-```text
-powershell.*-enc
-```
-
-may match unexpected strings because `.*` is broad.
-
-Always ask:
-
-> "Is my pattern specific enough for the investigation?"
-
-Sometimes a more carefully designed regex is better than adding `.*` everywhere.
-
-Don't use regex just because it is powerful.
-
-Use the smallest pattern that accurately describes the requirement.
-
----
-
-# 3.36 Exact Match vs Word Match vs Substring Match
-
-This is worth remembering.
-
-### Exact value
-
-```spl
-FileName="powershell.exe"
-```
-
-The field value should equal the requested value under search semantics.
-
-### Substring / regex search
-
-```spl
-| where match(CommandLine, "(?i)powershell")
-```
-
-Find `powershell` within the value.
-
-### Whole-word regex
-
-```spl
-| where match(CommandLine, "(?i)\bpowershell\b")
-```
-
-Find `powershell` as a word.
-
-### Starts with
-
-```spl
-| where match(CommandLine, "(?i)^powershell")
-```
-
-The value must start with `powershell`.
-
-### Ends with
-
-```spl
-| where match(FileName, "(?i)\.exe$")
-```
-
-The value must end with `.exe`.
-
-These are different hunting requirements.
-
----
-
-# 3.37 `IN` — Several Known Values
-
-Sometimes regex is not necessary.
-
-Suppose you want:
+Suppose you know the complete values you want:
 
 ```text
 cmd.exe
@@ -1761,10 +828,13 @@ powershell.exe
 pwsh.exe
 ```
 
+Do not automatically write a regex.
+
 Traditional SPL:
 
 ```spl
-index=windows FileName IN ("cmd.exe","powershell.exe","pwsh.exe")
+index=windows
+| search FileName IN ("cmd.exe","powershell.exe","pwsh.exe")
 ```
 
 SPL2 `search`:
@@ -1773,543 +843,279 @@ SPL2 `search`:
 search index=windows FileName IN ("cmd.exe","powershell.exe","pwsh.exe")
 ```
 
-This is clearer than a long chain of OR expressions when the possibilities are known values.
+`IN` is intended for a list of field-value matches.
 
-Do not use regex just because regex is available.
+Regex becomes more useful when the values share a pattern rather than a short known list.
 
 ---
 
-# 3.38 Wildcards With `IN`
+# 3.20 `CASE()` for Case-Sensitive `search`
 
-The `search` language also supports wildcard patterns inside `IN`.
+Normal Splunk `search` behavior is case-insensitive for terms and field values.
+
+When the exact capitalization matters, Splunk provides:
+
+```text
+CASE()
+```
 
 For example:
 
 ```spl
-index=windows status IN (4*,5*)
+search host=CASE(LOCALHOST)
 ```
 
-This can match status values beginning with `4` or `5`.
+searches for the specified case.
 
-SPL2 `search` supports the same search-style wildcard behavior.
+This belongs to the `search` language, not regex.
 
-This gives you three useful approaches:
+Therefore keep these separate in your mind:
 
 ```text
-One exact value
-    ↓
-field="value"
+CASE()
+   |
+   +-- case-sensitive search term/value
 
-Several exact values
-    ↓
-field IN (...)
-
-Several patterns
-    ↓
-field IN ("prefix*","other*")
+(?i)
+   |
+   +-- case-insensitive regex
 ```
+
+Splunk's official documentation describes `CASE()` as a directive for case-sensitive term and field-value matching. [Official source: Splunk Search Manual — Use CASE() and TERM() to match phrases.] 
 
 ---
 
-# 3.39 `NOT` vs `!=`
+# 3.21 `TERM()` for Indexed Terms With Punctuation
 
-This is another important Splunk detail.
+Another search feature worth knowing before we leave this chapter is:
+
+```text
+TERM()
+```
+
+`TERM()` tells Splunk to treat the contents as a single indexed term, which can be useful when the value contains minor segmenters [minor segmenters: characters Splunk can recognize as boundaries between indexed terms], such as periods.
+
+A common example is:
+
+```spl
+search TERM(127.0.0.1)
+```
+
+This is not regex.
+
+It is a search-time instruction about how Splunk should match an indexed term.
+
+Do not use `TERM()` simply because a value contains a dot; it has specific indexing and tokenization semantics.
+
+Splunk's current Search Manual documents `TERM()` for terms containing minor segmenters such as periods or underscores and explains its boundaries and limitations. [Official source: Splunk Search Manual — Use CASE() and TERM() to match phrases.]
+
+---
+
+# 3.22 `regex` vs `match()`
+
+These two often confuse beginners because both use regex.
+
+### Traditional SPL `regex`
+
+```spl
+| regex CommandLine="(?i)powershell"
+```
+
+Its purpose is to remove results that do not match the expression.
+
+### SPL/SPL2 `match()`
+
+```spl
+| where match(CommandLine, "(?i)powershell")
+```
+
+or:
+
+```spl2
+FROM windows
+WHERE match(CommandLine, "(?i)powershell")
+```
+
+Its purpose is to return a Boolean result that can be used inside an expression.
+
+Think:
+
+```text
+regex
+  |
+  +-- command that filters
+
+match()
+  |
+  +-- function that returns TRUE/FALSE
+```
+
+The difference is not the regex itself; it is the role of the regex in the search.
+
+---
+
+# 3.23 `regex` vs `rex`
+
+This distinction is just as important.
+
+### `regex` — filtering
+
+```spl
+index=windows
+| regex CommandLine="(?i)powershell"
+```
+
+Question:
+
+> Does this event match the regex?
+
+### `rex` — extraction
+
+```spl
+index=windows
+| rex field=CommandLine "(?<shell>powershell|pwsh)"
+```
+
+Question:
+
+> Can I extract information from the field using this regex?
+
+The result of the second command is a new field named `shell`.
+
+The official Splunk 10.4 `rex` reference explicitly distinguishes extraction/replacement from the filtering behavior of `regex`. [Official source: Splunk Enterprise 10.4 Search Reference — `rex` and `regex`.]
+
+---
+
+# 3.24 `rex` Does Not Mean "Filter With Regex"
+
+A common mistake is to expect:
+
+```spl
+| rex field=CommandLine "(?i)powershell"
+```
+
+to behave like:
+
+```spl
+| regex CommandLine="(?i)powershell"
+```
+
+They have different purposes.
+
+`rex` is useful when you have a pattern and want to extract a named capture group.
+
+For example:
+
+```spl
+| rex field=CommandLine "(?<shell>powershell|pwsh)"
+```
+
+creates `shell` when the expression matches.
+
+If your goal is only to keep matching events, use `regex` in traditional SPL or `match()` in an expression.
+
+---
+
+# 3.25 A Reliable Way to Test a Regex
+
+When a regex appears not to work, do not immediately change the regex five times.
+
+Test the layers separately.
+
+## Test 1 — Does the field exist?
+
+```spl
+index=windows
+| table FileName CommandLine
+```
+
+Check whether `FileName` is actually present in the returned events.
+
+## Test 2 — Look directly at `_raw`
+
+```spl
+index=windows
+| table _raw FileName CommandLine
+```
+
+If the text is visible in `_raw` but the field is missing, this is a **field extraction issue**, not a regex issue.
+
+## Test 3 — Test the regex against `_raw`
+
+```spl
+index=windows
+| regex "(?i)powershell"
+```
+
+If this works, the regex is matching the raw event.
+
+## Test 4 — Test it against the field
+
+```spl
+index=windows
+| regex CommandLine="(?i)powershell"
+```
+
+If Test 3 works and Test 4 does not, investigate the field extraction.
+
+This troubleshooting sequence is much better than blindly changing the pattern.
+
+---
+
+# 3.26 Why Your Original Example Can Appear Not to Work
 
 Consider:
 
 ```spl
-search fieldA!="value2"
+| regex FileName="(?i)powershell"
 ```
 
-This is a field/value comparison.
-
-Whereas:
-
-```spl
-search NOT fieldA="value2"
-```
-
-is the negation of the search condition.
-
-Splunk documents that these can differ when the field is missing.
-
-Therefore:
+There are several separate possibilities:
 
 ```text
-!=
-    ↓
-Field/value comparison
+Regex syntax wrong?
+       |
+       +-- No. The SPL syntax is valid.
 
-NOT
-    ↓
-Negation of the search condition
+FileName exists?
+       |
+       +-- Maybe not.
+
+FileName contains PowerShell?
+       |
+       +-- Maybe the value is stored in another field.
+
+Text exists only in _raw?
+       |
+       +-- Then search _raw or extract the field first.
+
+Running SPL2 instead of traditional SPL?
+       |
+       +-- Use match() in WHERE/where.
 ```
 
-This becomes especially important when investigating fields that may not be extracted consistently.
+This is why a failed regex test does not automatically prove that the regex is invalid.
+
+The official SPL `regex` syntax is valid exactly as shown above; the surrounding data and language context determine whether it produces matches. [Official source: Splunk Enterprise 10.4 `regex` command.]
 
 ---
 
-# 3.40 Missing Fields
+# 3.27 A Complete PowerShell Example
 
-You may sometimes need to ask:
+Now we can build a real investigation without repeating the basic search lessons from Chapter 2.
 
-> Which events do not contain this field?
+Requirement:
 
-A common search technique is:
+> Find process events where the command line contains PowerShell and later contains `-enc` or `-encodedcommand`, ignoring capitalization.
 
-```spl
-| search NOT field=*
-```
-
-This uses the wildcard to test whether the field has a value in search semantics, so the negation can identify events where that field is absent/null.
-
-Do not casually replace it with:
-
-```spl
-field!=*
-```
-
-because Splunk documents different behavior for `NOT field=*` and `field!=*`.
-
----
-
-# 3.41 `where` — Expression-Based Filtering
-
-Traditional SPL also has:
-
-```spl
-where
-```
-
-For example:
+### Traditional SPL with `regex`
 
 ```spl
 index=windows
-| where EventCode=4625
+| regex CommandLine="(?i)powershell.*-(enc|encodedcommand)"
 ```
 
-The `where` command evaluates an expression and returns only events where the expression evaluates to true.
-
-It is more powerful than a basic `search` predicate because it can work with expressions and compare fields.
-
-For example:
-
-```spl
-index=network
-| where src_port=dest_port
-```
-
-This compares one field against another field.
-
-The `search` command does not interpret the right-hand field name as another field in the same way.
-
----
-
-# 3.42 Search vs `where`
-
-Think of them like this.
-
-### `search`
-
-Best suited for:
-
-```text
-Index/event retrieval
-Keyword searches
-Field=value predicates
-Wildcards
-IN
-CASE
-TERM
-Basic Boolean search syntax
-```
-
-### `where`
-
-Best suited for:
-
-```text
-Boolean expressions
-Field-to-field comparison
-Evaluation functions
-Arithmetic
-LIKE
-match()
-Other expression-based logic
-```
-
-For example:
-
-```spl
-index=network
-| search src_port=443
-```
-
-asks for a field/value search.
-
-But:
-
-```spl
-index=network
-| where src_port=dest_port
-```
-
-asks for an expression comparing two fields.
-
-That difference is fundamental.
-
----
-
-# 3.43 SPL2 `WHERE` Clause
-
-SPL2 puts the same expression-based filtering idea directly into the `FROM` command:
-
-```spl2
-FROM network
-WHERE src_port=dest_port
-```
-
-You can also use the standalone SPL2 `where` command in a pipeline:
-
-```spl2
-FROM network
-| where src_port=dest_port
-```
-
-The SPL2 documentation describes the `where` command as equivalent to the `WHERE` clause in the `from` command.
-
----
-
-# 3.44 `AND`, `OR`, and Parentheses
-
-When you combine conditions, pay attention to precedence [precedence: the order in which expressions are evaluated].
-
-For example:
-
-```spl
-index=windows
-| search user=administrator OR user=system EventCode=4688
-```
-
-Do not rely on memory about how a complex Boolean expression will be grouped.
-
-Use parentheses when the intended logic matters:
-
-```spl
-index=windows
-| search (user=administrator OR user=system) EventCode=4688
-```
-
-For `where`/expression logic, parentheses are especially important.
-
-SPL2 documents different evaluation precedence between `search` and `where` expressions, so explicit parentheses are the safest habit for complicated Boolean logic.
-
----
-
-# 3.45 Regex `|` vs Search Pipeline `|`
-
-This is a common beginner mistake.
-
-In a Splunk search:
-
-```text
-|
-```
-
-normally means:
-
-```text
-pass results to the next command
-```
-
-But inside a regex:
-
-```text
-|
-```
-
-means:
-
-```text
-OR
-```
-
-For example:
-
-```text
-(powershell|pwsh)
-```
-
-contains regex OR.
-
-Because the same character is also Splunk's pipeline separator, the regex expression must be quoted as one expression so that the pipe remains part of the regex.
-
----
-
-# 3.46 Backslashes and Escaping
-
-Regex uses:
-
-```text
-\
-```
-
-as an escape character.
-
-For example:
-
-```text
-\.
-```
-
-means a literal period.
-
-But Splunk search syntax also has its own handling of backslashes and quotation marks.
-
-This becomes especially noticeable with Windows paths.
-
-For example:
-
-```text
-C:\Windows\System32
-```
-
-may require additional escaping depending on where the expression is written.
-
-The important lesson is:
-
-```text
-There are two things to understand:
-
-1. Splunk string/search escaping
-2. Regex escaping
-```
-
-Do not assume that every backslash is consumed by the same layer.
-
----
-
-# 3.47 PCRE and PCRE2
-
-Splunk regular-expression support is based on the Perl-compatible regular-expression family.
-
-For current Splunk search documentation, regex is described using PCRE behavior.
-
-For current Splunk data-processing pipelines, such as Edge Processor and Ingest Processor, Splunk documents PCRE2 as the current regex engine.
-
-This matters because older examples online may use RE2 syntax.
-
-Therefore:
-
-```text
-Older pipeline examples
-        ↓
-May use RE2
-
-Current pipelines
-        ↓
-PCRE2
-```
-
-Do not blindly copy old pipeline regex examples without checking which engine the documentation refers to.
-
----
-
-# 3.48 `rex` — Regex Extraction
-
-The `rex` command is extremely important and deserves to be introduced here even though we will study extraction in greater depth later.
-
-Suppose the event contains:
-
-```text
-user=john src_ip=10.10.10.5
-```
-
-You can extract the values using named capture groups.
-
-Traditional SPL:
-
-```spl
-index=security
-| rex "user=(?<username>\S+) src_ip=(?<src_ip>\S+)"
-```
-
-Now Splunk creates fields such as:
-
-```text
-username
-src_ip
-```
-
-This is regex being used to **extract information** rather than merely filter events.
-
----
-
-# 3.49 `rex` Against a Specific Field
-
-Instead of the entire raw event, you can specify a field:
-
-```spl
-index=security
-| rex field=CommandLine "user=(?<username>\S+)"
-```
-
-In SPL2, the field option is written before the regex expression:
-
-```spl2
-FROM security
-| rex field=CommandLine "user=(?<username>\S+)"
-```
-
-Current SPL2 documentation also places `max_match` and `offset_field` before the regex expression.
-
----
-
-# 3.50 `rex` Can Also Perform Sed Replacement
-
-`rex` is not only for extraction.
-
-It also supports:
-
-```text
-mode=sed
-```
-
-for replacement/substitution.
-
-For example:
-
-```spl2
-| rex field=password mode=sed "s/Secret123/********/g"
-```
-
-This is useful for string replacement and becomes relevant to our later masking study.
-
-The mental model is:
-
-```text
-regex
-   ↓
-match / filter
-
-rex
-   ↓
-extract
-
-rex mode=sed
-   ↓
-replace
-```
-
----
-
-# 3.51 Search-Time Masking vs Ingest-Time Masking
-
-Do not confuse a search-time operation such as:
-
-```spl2
-| rex field=password mode=sed "s/.*/********/g"
-```
-
-with permanent ingestion-time masking.
-
-A search-time transformation affects the result being processed by the search. It does not by itself rewrite the original indexed event.
-
-Ingest-time masking is a separate processing stage that happens before or during delivery to a destination.
-
-That distinction will become important when we study:
-
-```text
-props.conf
-transforms.conf
-SEDCMD
-INGEST_EVAL
-Ingest Processor
-Edge Processor
-```
-
----
-
-# 3.52 A Practical Decision Process
-
-When searching a string, ask these questions in order.
-
-### Question 1 — Do I need an exact value?
-
-Use:
-
-```text
-field="value"
-```
-
-### Question 2 — Do I need several known values?
-
-Use:
-
-```text
-field IN ("value1","value2")
-```
-
-### Question 3 — Do I need a simple prefix/suffix pattern?
-
-Consider a search wildcard:
-
-```text
-field="prefix*"
-```
-
-or, in SPL2 expression filtering:
-
-```text
-field LIKE "prefix%"
-```
-
-### Question 4 — Do I need a complex pattern?
-
-Use regex:
-
-```text
-match(field,"regex")
-```
-
-or the traditional SPL `regex` command when a dedicated regex filter is appropriate.
-
-### Question 5 — Do I need to extract data from text?
-
-Use:
-
-```text
-rex
-```
-
-This decision process is more useful than memorizing a table of operators.
-
----
-
-# 3.53 A Real Investigation Example
-
-Imagine your SOC receives an alert:
-
-> "Investigate possible encoded PowerShell execution."
-
-Start with a broad but relevant process search.
-
-### Traditional SPL
-
-```spl
-index=windows
-| search FileName="powershell*"
-```
-
-Then look for encoded-command indicators:
-
-```spl
-index=windows
-| search FileName="powershell*"
-| where match(CommandLine, "(?i)-(enc|encodedcommand)")
-```
-
-Or combine the pattern:
+### Traditional SPL with `where` and `match()`
 
 ```spl
 index=windows
@@ -2323,385 +1129,350 @@ FROM windows
 WHERE match(CommandLine, "(?i)powershell.*-(enc|encodedcommand)")
 ```
 
-Now the query expresses the actual investigation:
+Break the pattern down:
 
 ```text
-Process event/data
-        ↓
-PowerShell
-        ↓
-Encoded-command parameter
+(?i)
+  |
+  +-- ignore case
+
+powershell
+  |
+  +-- find PowerShell
+
+.*
+  |
+  +-- allow intervening characters
+
+-
+  |
+  +-- hyphen
+
+(enc|encodedcommand)
+  |
+  +-- either parameter name
 ```
+
+This is a pattern-based investigation, which is exactly where regex becomes useful.
 
 ---
 
-# 3.54 Why Search Method Matters for Performance
+# 3.28 A More Precise Pattern
 
-Not all matching methods have the same search behavior.
+The previous expression can be broad because `.*` allows almost anything between the two pieces.
 
-A highly specific search such as:
+If you know that there should be whitespace before the option, a more precise pattern might be:
 
-```spl
-index=windows EventCode=4625 user=administrator
+```text
+powershell.*\s-(enc|encodedcommand)\b
 ```
 
-gives Splunk useful indexed/searchable information early.
-
-A broad regex over `_raw` such as:
+Traditional SPL:
 
 ```spl
 index=windows
-| regex "(?i)powershell"
+| regex CommandLine="(?i)powershell.*\s-(enc|encodedcommand)\b"
 ```
 
-may require more work because the regex is being applied to event text.
+SPL2:
 
-This does not mean regex is bad.
+```spl2
+FROM windows
+WHERE match(CommandLine, "(?i)powershell.*\s-(enc|encodedcommand)\b")
+```
 
-It means you should narrow the dataset and use exact/searchable predicates where you can before using expensive pattern matching.
-
-The same principle matters later when we build production SOC detections and ingestion pipelines.
+Do not automatically make a regex more complicated. Add precision only when the investigation requirement justifies it.
 
 ---
 
-# 3.55 Common Beginner Mistakes
+# 3.29 Performance: Be Specific Before You Use Regex
 
-## Mistake 1 — Copying LogScale regex syntax
+Regex is flexible, but you should not use it for every search.
 
-Do not automatically write:
+For example, when you know the exact value:
+
+```spl
+index=windows FileName="powershell.exe"
+```
+
+is conceptually simpler than:
+
+```spl
+index=windows
+| regex FileName="(?i)^powershell\.exe$"
+```
+
+Likewise, if a search wildcard is enough:
+
+```spl
+index=windows FileName="powershell*"
+```
+
+there is no need to replace it with a regex merely because regex is more powerful.
+
+Splunk's wildcard guidance recommends being as specific as possible and warns that poorly chosen wildcards, particularly broad leading wildcards, can increase the search cost. [Official source: Splunk Search Manual — Wildcards.]
+
+The same general rule applies to regex design:
+
+```text
+Specific search
+     |
+     +-- easier to understand
+     +-- easier to test
+     +-- often less work
+
+Broad regex
+     |
+     +-- more accidental matches
+     +-- more difficult to debug
+```
+
+---
+
+# 3.30 Current Regex Engine Note
+
+There are two related but different contexts in current Splunk documentation.
+
+For Splunk search language documentation, regular expressions are documented as PCRE [PCRE: Perl Compatible Regular Expressions].
+
+For current Edge Processor and Ingest Processor pipelines, Splunk moved to PCRE2 [PCRE2: the newer major version of the Perl-compatible regular-expression engine]. Splunk's pipeline documentation states that from June 5, 2025, RE2 support ended and pipelines use PCRE2.
+
+Therefore, when you copy an old example from the internet, first determine whether it is:
+
+```text
+Traditional SPL search
+       |
+       +-- search regex semantics
+
+Edge / Ingest pipeline
+       |
+       +-- current pipeline regex semantics
+```
+
+Do not treat every regex example found online as version-neutral.
+
+---
+
+# 3.31 KQL Comparison — Only the Concept Matters
+
+You may already know KQL concepts such as:
+
+```text
+contains
+startswith
+endswith
+has
+matches regex
+```
+
+The useful way to translate them into Splunk is by requirement, not by name.
+
+| Requirement | Traditional SPL | SPL2 |
+|---|---|---|
+| Exact value | `field="value"` | `search field="value"` |
+| Prefix search with search syntax | `field="value*"` | `search field="value*"` |
+| Expression wildcard | `where like(field,"value%")` | `WHERE field LIKE "value%"` |
+| Regex filter | `regex field="regex"` | `WHERE match(field,"regex")` |
+| Several known values | `field IN (...)` | `search field IN (...)` |
+
+The important lesson is that there is not always a one-to-one operator mapping.
+
+---
+
+# 3.32 Practical Decision Table
+
+Use this as the working reference for the chapter.
+
+| What you want | Use |
+|---|---|
+| One exact known value | `field="value"` |
+| A few known values | `IN (...)` |
+| Prefix/suffix-style search with `search` | `*` wildcard |
+| Expression pattern in SPL2 `WHERE` | `LIKE` / `like()` |
+| Complex pattern filter in traditional SPL | `regex` |
+| Complex pattern as a Boolean expression | `match()` |
+| Extract values from text | `rex` |
+| Replace text at search time | `rex mode=sed` |
+| Case-sensitive `search` term/value | `CASE()` |
+| Match a single indexed term containing minor breakers | `TERM()` |
+
+---
+
+# 3.33 Common Mistakes
+
+## Mistake 1 — Copying LogScale regex delimiters
+
+Do not use:
 
 ```text
 /powershell/i
 ```
 
-in Splunk.
+as your Splunk regex syntax.
 
-Use a Splunk-compatible regex expression such as:
+Use:
+
+```spl
+"(?i)powershell"
+```
+
+inside the Splunk command/function.
+
+---
+
+## Mistake 2 — Assuming `regex` is the SPL2 equivalent of traditional SPL
+
+For traditional SPL:
 
 ```spl
 | regex CommandLine="(?i)powershell"
 ```
 
-or:
+For SPL2 expression filtering:
 
-```spl
+```spl2
 | where match(CommandLine, "(?i)powershell")
 ```
 
----
+or:
 
-## Mistake 2 — Treating `*` and `.*` as the same
-
-Search wildcard:
-
-```text
-powershell*
+```spl2
+FROM windows
+WHERE match(CommandLine, "(?i)powershell")
 ```
-
-Regex:
-
-```text
-powershell.*
-```
-
-They belong to different matching systems.
 
 ---
 
-## Mistake 3 — Using regex when `=` is enough
+## Mistake 3 — Using regex when an exact search is enough
 
-If you know:
-
-```text
-FileName=powershell.exe
-```
-
-there is usually no reason to write an elaborate regex.
-
-Use:
+Prefer:
 
 ```spl
 FileName="powershell.exe"
 ```
 
+over an elaborate regex when you already know the exact value.
+
 ---
 
-## Mistake 4 — Using `search` when you need field-to-field comparison
+## Mistake 4 — Using `.*` when unanchored matching already solves the problem
 
-Do not assume this means what it looks like:
+This:
+
+```text
+powershell
+```
+
+already searches for the pattern within the string for `regex` and `match()` semantics.
+
+You do not automatically need:
+
+```text
+.*powershell.*
+```
+
+---
+
+## Mistake 5 — Forgetting to test the field
+
+If:
 
 ```spl
-| search src_port=dest_port
+| regex FileName="(?i)powershell"
 ```
 
-The `search` command interprets the right side according to search-expression semantics rather than as the name of another field.
-
-Use:
+returns nothing, inspect:
 
 ```spl
-| where src_port=dest_port
+| table _raw FileName CommandLine
 ```
 
-when you want a field-to-field expression.
+before changing the regex.
 
 ---
 
-## Mistake 5 — Forgetting `NOT` vs `!=`
-
-These can produce different results when fields are missing.
-
-Know whether you mean:
+## Mistake 6 — Confusing a search wildcard with regex
 
 ```text
-field exists and is not value
+*
 ```
 
-or:
+in `search` is not the same language as:
 
 ```text
-the event should not satisfy this condition
+.*
 ```
+
+in regex.
 
 ---
 
-## Mistake 6 — Using a leading wildcard unnecessarily
+# 3.34 Chapter Summary
 
-Avoid:
+At the end of this chapter, you should be able to answer the most important question before writing a text search:
+
+> **What kind of match do I actually need?**
+
+You should now understand:
+
+- Traditional SPL `regex` is a filtering command.
+- The syntax `| regex FileName="(?i)powershell"` is valid traditional SPL.
+- If that search produces no results, check whether `FileName` exists and contains the value; the default target for `regex` is `_raw` when no field is specified.
+- SPL2 uses regular expressions through `match()` and related functions; do not copy the traditional SPL `regex` command blindly into SPL2.
+- `(?i)` is a Splunk regex modifier for case-insensitive matching.
+- Splunk regex matching is normally unanchored, so a pattern such as `powershell` can match a substring.
+- `^` anchors a regex to the start of a string.
+- `$` anchors a regex to the end of a string.
+- `\b` expresses a word boundary.
+- `\.` matches a literal period.
+- `|` inside a regex expresses OR.
+- `*` in the `search` language is a wildcard; it is not the regex `.*` construct.
+- SPL2 `WHERE` uses `LIKE` / `like()` with `%` and `_` for expression-based wildcard matching.
+- `IN` is preferable when you simply have a short list of known values.
+- `CASE()` provides case-sensitive matching for `search`.
+- `TERM()` provides special indexed-term matching for values containing minor segmenters.
+- `regex` filters; `rex` extracts or replaces; `match()` evaluates a regex as TRUE/FALSE.
+- Search debugging should distinguish a bad regex from a missing/unextracted field.
+- Current Splunk pipeline regex documentation uses PCRE2, so old RE2 pipeline examples need version checking.
+
+The central mental model is:
 
 ```text
-*something
+                     TEXT SEARCH REQUIREMENT
+                              |
+                 +------------+-------------+
+                 |                          |
+            Known value                Pattern
+                 |                          |
+           +-----+-----+              +-----+------+
+           |           |              |            |
+        Exact         List        Simple        Complex
+           |           |          wildcard       regex
+           |           |              |            |
+           v           v              v            v
+         field=      IN(...)        * / LIKE     regex / match()
+
+                           |
+                           v
+                    Need to extract?
+                           |
+                           v
+                          rex
 ```
 
-when a more specific search can express the requirement.
-
-Prefix wildcards can have a performance cost.
+The next chapter can now move into **field extraction in practice**, where we will work directly with `_raw` and learn how regex becomes an extraction tool rather than only a filtering tool. That will give us the bridge into `rex`, search-time extraction, `props.conf`, `transforms.conf`, indexed extraction, and eventually ingest-time filtering, routing, and masking.
 
 ---
 
-## Mistake 7 — Assuming SPL2 `WHERE` uses `*`
+# Official Splunk Documentation Basis
 
-For SPL2 expression filtering:
+This chapter is based on the current official Splunk documentation relevant to Splunk Enterprise 10.4 and current SPL2 behavior, especially:
 
-```spl2
-WHERE FileName LIKE "powershell%"
-```
-
-is the expression-based wildcard form.
-
-Do not confuse it with:
-
-```spl2
-search FileName="powershell*"
-```
-
----
-
-## Mistake 8 — Confusing `regex` and `rex`
-
-Remember:
-
-```text
-regex
-    ↓
-FILTER
-
-rex
-    ↓
-EXTRACT / REPLACE
-```
-
----
-
-# 3.56 The Important Tools to Remember
-
-| Tool | Main purpose |
-|---|---|
-| `search` | Retrieve/filter events using search expressions |
-| `where` | Filter with Boolean/evaluation expressions |
-| `regex` | Filter events with regex in traditional SPL |
-| `match()` | Return true/false from a regex expression |
-| `rex` | Extract fields or perform sed replacement |
-| `LIKE` / `like()` | Pattern matching in SPL2 expressions; available in evaluation contexts |
-| `IN` | Match one field against multiple values |
-| `CASE()` | Force case-sensitive `search` matching |
-| `TERM()` | Treat indexed content as one term |
-
-These tools overlap in some situations, but they are not interchangeable.
-
----
-
-# 3.57 SPL vs SPL2 Cheat Sheet
-
-| Requirement | Traditional SPL | SPL2 |
-|---|---|---|
-| Start a search | `index=windows` | `FROM windows` |
-| Explicit search command | `search index=windows` | `search index=windows` |
-| Exact field value | `FileName="cmd.exe"` | `search FileName="cmd.exe"` |
-| Search wildcard | `FileName="powershell*"` | `search FileName="powershell*"` |
-| Expression filter | `\| where ...` | `WHERE ...` or `\| where ...` |
-| Regex filter | `\| regex field="pattern"` | Use `match()` in an expression |
-| Regex Boolean test | `\| where match(field,"regex")` | `WHERE match(field,"regex")` |
-| Regex extraction | `\| rex ...` | `\| rex field=... ...` |
-| Several values | `field IN (...)` | `search field IN (...)` |
-| Expression wildcard | `\| where like(field,"a%")` where supported | `WHERE field LIKE "a%"` |
-| Case-sensitive search | `CASE()` | `CASE()` with `search` |
-| Indexed-term matching | `TERM()` | `TERM()` with `search` |
-
-The important point is that SPL2 contains both a **search language** and a more explicit **expression language**, and those mechanisms have different semantics.
-
----
-
-# 3.58 The Most Important Mental Model
-
-At this point, think about text searching this way:
-
-```text
-                         SEARCH REQUIREMENT
-                                │
-                                ▼
-                        What do I know?
-                                │
-              ┌─────────────────┼─────────────────┐
-              │                 │                 │
-              ▼                 ▼                 ▼
-         Exact value       Several values       Pattern
-              │                 │                 │
-              ▼                 ▼                 ▼
-          field=value       field IN (...)      ┌─────────┐
-                                                 │         │
-                                                 ▼         ▼
-                                             Wildcard    Regex
-                                                 │         │
-                                                 │    ┌────┴────┐
-                                                 │    │         │
-                                                 ▼    ▼         ▼
-                                                *  match()   regex
-                                                   /rex
-```
-
-And remember:
-
-```text
-search
-    ↓
-Search language
-
-where
-    ↓
-Expression language
-
-regex
-    ↓
-Regex filtering
-
-match()
-    ↓
-Regex Boolean expression
-
-rex
-    ↓
-Regex extraction/replacement
-
-LIKE
-    ↓
-Expression-based wildcard pattern
-```
-
----
-
-# 3.59 Chapter Summary
-
-By the end of this chapter, you should understand:
-
-- Text searching is not one single operation in Splunk.
-- Traditional SPL and SPL2 both provide `search` and expression-based filtering, but their syntax and semantics differ.
-- A normal search field/value comparison is different from regex matching.
-- `search` is useful for retrieving/filtering events and supports keyword search, field/value expressions, Boolean logic, wildcards, `IN`, `CASE()`, and `TERM()`.
-- `where` evaluates Boolean expressions.
-- `search` and `where` are not interchangeable.
-- `regex` is a traditional SPL filtering command.
-- `match()` performs regex matching as a Boolean expression.
-- `rex` extracts fields or performs sed-style replacement.
-- `*` is a search wildcard.
-- In SPL2 expression filtering, `LIKE` uses `%` for multiple characters and `_` for one character.
-- Regex uses constructs such as `.`, `*`, `+`, `?`, `^`, `$`, `\b`, `\`, `()`, `[]`, and `|`.
-- `(?i)` is a common regex inline modifier for case-insensitive matching.
-- `TERM()` helps when searching indexed terms containing minor segmenters such as periods.
-- `CASE()` enables case-sensitive matching for `search`.
-- `IN` is useful when you have several known values.
-- `NOT` and `!=` are not always equivalent, especially when fields are missing.
-- Prefix wildcards can hurt search performance, so be as specific as possible.
-- Current Splunk pipelines use PCRE2, so older RE2 pipeline examples should not be copied blindly.
-
-The most important lesson is:
-
-> **Do not memorize syntax first. Identify the kind of match you need, then choose the Splunk operation that naturally expresses it.**
-
----
-
-# What We Have Covered So Far
-
-```text
-CHAPTER 1
-Understanding Splunk Events, Fields, and Data
-        │
-        ├── Event
-        ├── index
-        ├── host
-        ├── source
-        ├── sourcetype
-        ├── _raw
-        ├── _time
-        └── Indexed vs search-time fields
-        │
-        ▼
-CHAPTER 2
-Writing Your First SPL + SPL2 Search
-        │
-        ├── Search structure
-        ├── Pipelines
-        ├── Filtering
-        ├── AND / OR / NOT
-        ├── Comparisons
-        ├── WHERE
-        └── Basic search logic
-        │
-        ▼
-CHAPTER 3
-Text Searching, Wildcards, and Regex
-        │
-        ├── search
-        ├── where
-        ├── regex
-        ├── match()
-        ├── rex
-        ├── LIKE / like()
-        ├── wildcards
-        ├── IN
-        ├── CASE()
-        ├── TERM()
-        └── Regex fundamentals
-        │
-        ▼
-CHAPTER 4
-Field Extraction and Transformation
-```
-
----
-
-# Official Splunk Documentation Used for This Chapter
-
-This chapter follows the current official Splunk documentation for:
-
-- Search command — Overview, syntax, examples, and usage
-- Where command — Overview and syntax
-- SPL and regular expressions
-- About Splunk regular expressions
-- Wildcards
-- Comparison and conditional functions
-- Predicate expressions
-- `rex` command — Overview, syntax, and examples
-- `CASE()` and `TERM()` search behavior
-- Current regex behavior for SPL2 pipelines
-
-For this course, current official Splunk documentation takes precedence over older blog posts, third-party tutorials, and examples written for older Splunk releases.
+- Splunk Enterprise 10.4 Search Reference — `regex` command
+- Splunk Enterprise 10.4 Search Reference — `rex` command
+- Splunk Enterprise Search Manual — SPL and regular expressions
+- Splunk Enterprise SPL2 Search Manual — SPL2 and regular expressions
+- Splunk Enterprise SPL2 Search Reference — `match()` and comparison/conditional functions
+- Splunk Enterprise SPL2 Search Manual — Wildcards
+- Splunk Search Manual — `CASE()` and `TERM()`
+- Splunk Search Manual — Wildcards
