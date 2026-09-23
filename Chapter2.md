@@ -203,6 +203,8 @@ Keep events matching the condition
 The `from` command can also use clauses such as `WHERE`, `GROUP BY`,
 `SELECT`, `ORDER BY`, and `LIMIT`. ([Official Splunk documentation](https://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/from-command/from-command-syntax))
 
+Here if we use GROUP BY it must have SELECT. 
+
 ---
 
 # 2.4 Three Ways to Think About the Same Search
