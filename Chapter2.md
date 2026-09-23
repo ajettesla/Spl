@@ -263,7 +263,7 @@ For example:
 
 ```spl
 index=windows EventCode=4625
-| stats count by user
+| stats count() by user
 ```
 
 Read it from left to right:
@@ -282,7 +282,7 @@ For example:
 
 ```spl2
 search index=windows EventCode=4625
-| stats count by user
+| stats count() by user
 ```
 
 SPL2 also allows a `FROM` search followed by pipeline commands:
@@ -290,7 +290,7 @@ SPL2 also allows a `FROM` search followed by pipeline commands:
 ```spl2
 FROM windows
 WHERE EventCode=4625
-| stats count by user
+| stats count() by user
 ```
 
 Therefore:
@@ -358,14 +358,14 @@ Count by user:
 
 ```spl
 index=windows EventCode=4625
-| stats count by user
+| stats count() by user
 ```
 
 or:
 
 ```spl2
 search index=windows EventCode=4625
-| stats count by user
+| stats count() by user
 ```
 
 The SPL2 `FROM` form can also use aggregation [aggregation: calculating a
