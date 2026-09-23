@@ -415,14 +415,14 @@ Traditional SPL:
 
 ```spl
 index=windows process="powershell.exe"
-| stats count by host
+| stats count() by host
 ```
 
 SPL2 using `search`:
 
 ```spl2
 search index=windows process="powershell.exe"
-| stats count by host
+| stats count() by host
 ```
 
 SPL2 using `FROM`:
@@ -430,7 +430,7 @@ SPL2 using `FROM`:
 ```spl2
 FROM windows
 WHERE process="powershell.exe"
-| stats count by host
+| stats count() by host
 ```
 
 The syntax is secondary.
@@ -1134,14 +1134,14 @@ Traditional SPL:
 
 ```spl
 index=windows EventCode=4625
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 SPL2 using an SPL-style pipeline:
 
 ```spl2
 search index=windows EventCode=4625
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 SPL2 using `FROM`:
@@ -1288,7 +1288,7 @@ This answers:
 For example:
 
 ```spl
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 or:
@@ -1364,7 +1364,7 @@ They memorize:
 
 ```spl
 index=windows EventCode=4625
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 But then someone asks:
@@ -1389,7 +1389,7 @@ Then you can build a new search:
 
 ```spl
 index=windows EventCode=4624
-| stats count by host
+| stats count() by host
 ```
 
 Or:
@@ -1723,7 +1723,7 @@ Traditional SPL:
 
 ```spl
 index=windows EventCode=4625
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 SPL2:
@@ -1761,14 +1761,14 @@ Traditional SPL example:
 
 ```spl
 index=windows EventCode=4625
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 SPL2 using SPL-style syntax:
 
 ```spl2
 search index=windows EventCode=4625
-| stats count by TargetUserName
+| stats count() by TargetUserName
 ```
 
 SPL2 using `FROM`:
