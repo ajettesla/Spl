@@ -1,434 +1,510 @@
-# SPL2 Edge Processor — Complete Data-Flow, Filtering, Dropping, Routing, Copying, Deduplication, and Optimization Guide
+# SPL2 Edge Processor — Data Flow, Filtering, Dropping, Transformation, Routing, Copying, Deduplication, Aggregation, and Pipeline Design
 
-> **Purpose:** A systematic reference for designing SPL2 Edge Processor pipelines correctly, with concrete examples, event-flow diagrams, destination strategy, early filtering, masking, routing, `where`, `dedup`, `stats`, `if`, `route`, `thru`, and `branch`.
->
-> **Documentation basis:** Current Splunk documentation checked in September 2026. The current Edge Processor pipeline syntax supports the commands and functions described in this guide; regular expressions in current pipelines use PCRE2.
+## Purpose
 
----
+This note explains how to design SPL2 pipelines for Splunk Edge Processor in a systematic way.
 
-## 1. The most important idea: think about the event flow
+The focus is not on memorizing commands. The focus is understanding:
 
-Do not learn Edge Processor commands as isolated syntax.
+1. What happens to an event at each stage.
+2. Which commands keep an event, remove it, change it, copy it, or redirect it.
+3. Where filtering should happen.
+4. How to choose between `where`, `route`, `thru`, `branch`, `dedup`, `stats`, and `if`.
+5. How partitioning in the Edge Processor builder relates to `from $source`.
+6. How to design a pipeline that is correct, understandable, and avoids unnecessary processing.
 
-Instead, ask:
-
-> **What do I want to happen to this event?**
-
-There are several fundamentally different answers:
-
-```text
-I want to receive it
-    -> from
-
-I want to send it somewhere
-    -> into
-
-I want to change it
-    -> eval / replace / rename / fields / rex / spath / ocsf / decrypt
-
-I want to remove the event
-    -> where
-
-I want to remove duplicate events
-    -> dedup
-
-I want to summarize many events
-    -> stats
-
-I want to send a subset somewhere else
-    -> route
-
-I want an additional copy but want the original to continue
-    -> thru
-
-I want multiple complete processing paths
-    -> branch
-
-I want different processing depending on a condition
-    -> if
-
-I want to enrich it with external data
-    -> lookup
-
-I want to expand structured or multivalue data
-    -> expand / flatten / mvexpand
-```
-
-This is the foundation for everything else.
+Splunk's current documentation describes an Edge Processor pipeline as an SPL2 module containing a `$pipeline` statement. A pipeline uses `from $source`, optional processing commands, and `into $destination`. The subset processed by `from $source` is determined by the **partition configured in the pipeline builder**. The builder also configures destinations used by `into`. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/working-with-pipelines/edge-processor-pipeline-syntax)
 
 ---
 
-# 2. The complete Edge Processor model
+# 1. The first thing to understand: a pipeline has two configuration layers
 
-A practical pipeline can be thought of as:
+An Edge Processor pipeline has configuration outside the SPL2 body and processing inside the SPL2 body.
 
-```text
-SOURCE / FORWARDER / DEVICE
-          |
-          v
-   EDGE PROCESSOR
-          |
-          v
-     PARTITION
-          |
-          v
-   EARLY FILTERING
-       where
-          |
-          v
-   FIELD EXTRACTION
-    rex / spath
-          |
-          v
-   REDUCTION
- dedup / stats
-          |
-          v
-  TRANSFORMATION
- eval / replace / rename / fields
-          |
-          v
-   ENRICHMENT
-       lookup
-          |
-          v
-      ROUTING
-       route
-      /     \
-     /       \
-    v         v
-dest-A     remaining
-             |
-             v
-          dest-B
-```
+## Layer 1 — Pipeline configuration in the builder
 
-This is a **logical design model**, not a requirement that every pipeline contain every stage.
+The Edge Processor UI asks you to configure things such as:
 
-The order should be driven by what the event must do and by how much processing you can avoid.
+- Partition
+- Sample data
+- Destination
 
----
+The **partition** defines the subset of incoming data that this particular pipeline receives.
 
-# 3. Very important: an Edge Processor does NOT drop a network packet
+The **destination** defines where `into $destination` sends the processed data.
 
-This is where your eBPF comparison needs one correction.
-
-### eBPF/network filtering
-
-Conceptually:
+For example:
 
 ```text
-packet arrives
+Incoming data
       |
       v
-early kernel filter
++------------------+
+| Pipeline         |
+| partition        |
+| host = server01  |
+| sourcetype=firewall
++------------------+
       |
-   unwanted?
-    /    \
-  YES     NO
-   |       |
- DROP    continue
+      v
+Only selected data enters this pipeline
 ```
 
-The packet can be discarded before later network processing.
+Current Splunk documentation says that when creating an Edge Processor pipeline, you must specify the subset of received data to process by defining a partition in the pipeline builder. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/filter-and-mask-data-using-an-edge-processor)
 
-### Edge Processor filtering
+## Layer 2 — SPL2 pipeline body
 
-The event must first reach the Edge Processor:
-
-```text
-source / forwarder
-       |
-       | network traffic
-       v
-Edge Processor
-       |
-       v
-   where filter
-       |
-    /       \
- unwanted   wanted
-    |          |
-   DROP      continue
-```
-
-`where` can prevent the event from being sent to the pipeline destination, but it cannot prevent the source or forwarder from having already transmitted the event to the Edge Processor.
-
-Therefore:
-
-```text
-Want to reduce bytes sent TO the Edge Processor?
-    -> filter earlier, at the source/agent/network layer.
-
-Want to reduce processing and downstream data AFTER the Edge Processor receives it?
-    -> use Edge Processor filtering and transformation.
-```
-
-Splunk describes Edge Processor as processing data after it is received and then sending the resulting data to destinations. It also states that Edge Processor filtering can reduce the amount of data sent downstream. See the official documentation listed in the Sources section.
-
----
-
-# 4. Partition vs `where`: these are NOT the same
-
-This is one of the most important concepts.
-
-## 4.1 Partition
-
-A pipeline partition defines the subset of incoming data that a pipeline is intended to process.
-
-For example, you may configure a partition using:
-
-```text
-host
-source
-sourcetype
-```
-
-Conceptually:
-
-```text
-All incoming data
-       |
-       v
-    partition
-       |
-   +---+---+
-   |       |
-selected  not selected
-   |          |
-   v          v
-pipeline   unprocessed
-```
-
-The partition is a scope for the pipeline.
-
-Splunk documents that data not selected by a pipeline partition is considered unprocessed. If the Edge Processor has a default destination, unprocessed data goes there; if no default destination is configured, unprocessed data is dropped.
-
-## 4.2 `where`
-
-`where` is an actual processing/filtering step inside the pipeline:
+The SPL2 then looks like:
 
 ```spl
-| where <condition>
-```
+import route from /splunk/ingest/commands
 
-Data that does not satisfy the predicate is removed from the pipeline and is not sent to the destination.
-
-Example:
-
-```spl
 $pipeline = | from $source
-    | where sourcetype == "firewall"
+    | <processing commands>
     | into $destination;
 ```
 
-Conceptually:
-
-```text
-pipeline input
-      |
-      v
-where sourcetype == "firewall"
-      |
-   +--+--+
-   |     |
-firewall other
-   |      |
-   v      v
-keep    DROP
-```
-
-### Important current behavior
-
-Current Edge Processor behavior treats `where` clauses in the pipeline body as filters. An older behavior treated certain `where` clauses immediately after `from $source` as partition conditions; Splunk changed that behavior in January 2024.
-
-Therefore, when the goal is:
-
-> **"Drop these events."**
-
-Use the pipeline's filtering logic (`where`), and configure the partition separately for the broad dataset scope.
+The partition is not normally written into the `$pipeline` statement itself. `$source` represents the subset selected by the partition configured in the pipeline builder. [Official documentation](https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/working-with-pipelines/edge-processor-pipeline-syntax)
 
 ---
 
-# 5. Best mental model for filtering
+# 2. Why your pipeline says "configure the pipeline to specify subset of data to process"
 
-Use two levels:
+Suppose you enter:
+
+```spl
+import route from /splunk/ingest/commands
+
+$pipeline = | from $source
+    | eval _raw=replace(_raw, /CreditCard=[0-9]+/, "CreditCard=XXXXXXXXXXX")
+    | into $destination;
+```
+
+and the Edge Processor builder says something like:
+
+> Configure the pipeline to specify a subset of data to process.
+
+That message is referring to the **pipeline partition**, not to the `route` statement.
+
+You need to configure the partition in the UI.
+
+For example:
 
 ```text
+Pipeline builder
+    |
+    +-- Partition
+    |      |
+    |      +-- Field: sourcetype
+    |      +-- Action: Keep
+    |      +-- Operator: =
+    |      +-- Value: syslog
+    |
+    +-- Destination
+           |
+           +-- Splunk platform
+```
+
+Then the SPL2 can use:
+
+```spl
+$pipeline = | from $source
+    | eval ...
+    | into $destination;
+```
+
+The `from $source` command is the reference to the partition-selected subset. Splunk's current syntax documentation explicitly states that the subset for `from $source` is determined by the pipeline partition configured in the builder. [Official documentation](https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/working-with-pipelines/edge-processor-pipeline-syntax)
+
+---
+
+# 3. Important correction to your comment
+
+You currently have:
+
+```spl
+/*
+A valid SPL2 statement for a pipeline must start with "$pipeline", and include "from $source"
+and "into $destination".
+*/
+```
+
+That comment is too strict.
+
+The **pipeline statement** contains:
+
+```spl
+$pipeline = ...
+```
+
+but the complete SPL2 module can have an `import` statement before it.
+
+Your own route pipeline correctly starts with:
+
+```spl
+import route from /splunk/ingest/commands
+```
+
+and then:
+
+```spl
+$pipeline = ...
+```
+
+Splunk's current route documentation uses exactly this pattern:
+
+```spl
+import route from /splunk/ingest/commands
+$pipeline = | from $source
+...
+```
+
+So a better comment is:
+
+```spl
+/*
+An Edge Processor pipeline contains a $pipeline statement
+with from $source and into $destination.
+Additional import statements may appear before the $pipeline statement.
+*/
+```
+
+---
+
+# 4. The complete event-flow model
+
+Think about the pipeline as a series of decisions.
+
+```text
+SOURCE
+  |
+  v
 PARTITION
-    "Which broad class of data should this pipeline process?"
-
-WHERE
-    "Which events inside that class should survive?"
+  |
+  v
+EARLY FILTER
+  |
+  v
+EXTRACTION
+  |
+  v
+REDUCTION
+  |
+  v
+TRANSFORMATION
+  |
+  v
+ENRICHMENT
+  |
+  v
+ROUTING / COPYING
+  |
+  v
+DESTINATION
 ```
 
-Example:
+Not every pipeline needs every stage.
 
-### Requirement
+The correct question is:
 
-Only process firewall logs from server01, but drop debug events.
-
-Partition:
-
-```text
-host = server01
-sourcetype = firewall
-```
-
-Pipeline:
-
-```spl
-$pipeline = | from $source
-    | where NOT match(_raw, /debug/i)
-    | into $destination;
-```
-
-Result:
-
-```text
-server01 + firewall + normal  -> keep
-server01 + firewall + debug   -> DROP
-
-other hosts / other sourcetypes
-    -> outside this partition
-    -> treated as unprocessed data
-```
-
-This is much cleaner than attempting to make one mechanism do both jobs.
+> What does this event need to become before it is sent to the destination?
 
 ---
 
-# 6. `where`: the real DROP mechanism
+# 5. The most important command classification
 
-There is no separate `drop` command required for normal Edge Processor filtering.
+## Input and output
 
-Use:
-
-```spl
-| where <predicate>
+```text
+from
+into
 ```
 
-`where` returns only events for which the predicate evaluates to TRUE.
+## Filter or reduce event count
 
-## Example 1 — drop Windows
+```text
+where
+dedup
+stats
+```
+
+## Parse or extract
+
+```text
+rex
+spath
+```
+
+## Transform an event
+
+```text
+eval
+replace
+rename
+fields
+if
+ocsf
+decrypt
+```
+
+## Enrich
+
+```text
+lookup
+```
+
+## Split or copy data flow
+
+```text
+route
+thru
+branch
+```
+
+## Expand structured data
+
+```text
+expand
+flatten
+mvexpand
+```
+
+This classification is more useful than memorizing syntax without understanding the event flow.
+
+---
+
+# 6. `where` — remove events from the pipeline
+
+## Concept
+
+Use `where` when your question is:
+
+> Should this event continue?
+
+The expression must evaluate to TRUE for the event to continue.
+
+Example:
+
+```spl
+| where profile == "linux"
+```
+
+means:
+
+```text
+profile=linux      -> KEEP
+profile=dns        -> DROP
+profile=firewall   -> DROP
+```
+
+Splunk's current SPL2 documentation states that `where` removes results that do not satisfy the predicate. In Edge Processor pipelines, data that does not match the predicate is not sent to the `into` destination; depending on the partition/default-destination behavior, the data may be dropped or sent to the default destination. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/where-command/where-command-overview-syntax-and-usage)
+
+## Example
 
 ```spl
 $pipeline = | from $source
-    | rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
-    | where profile != "windows"
+    | rex field=_raw /"profile":"(?P<profile>[^"]+)"/
+    | where profile == "linux"
     | into $destination;
 ```
 
 Input:
 
 ```text
-profile=linux
-profile=dns
-profile=windows
-profile=firewall
+{"profile":"linux","action":"login"}
+{"profile":"dns","action":"query"}
+{"profile":"firewall","action":"allow"}
 ```
 
 Output:
 
 ```text
-profile=linux
-profile=dns
-profile=firewall
+{"profile":"linux","action":"login"}
 ```
 
-`profile=windows` is gone.
+The other two events do not continue.
 
-## Example 2 — keep only security events
+---
 
-```spl
-| where action IN ("login", "logout", "password_change")
-```
+# 7. `where` for a deny rule
 
-Conceptually:
+If you want:
 
-```text
-login             -> KEEP
-logout            -> KEEP
-password_change   -> KEEP
-debug             -> DROP
-heartbeat         -> DROP
-```
+> Keep everything except debug.
 
-## Example 3 — drop debug logs
-
-If `action` has already been extracted:
+Use:
 
 ```spl
 | where action != "debug"
 ```
 
-If it has not been extracted and the raw data is JSON:
+Example:
 
-```spl
-| where NOT match(_raw, /"action"\s*:\s*"debug"/i)
+```text
+login    -> KEEP
+logout   -> KEEP
+query    -> KEEP
+debug    -> DROP
 ```
 
-## Example 4 — allow-list filtering
+This is usually clearer than routing the debug events to a destination that you do not actually need.
 
-Suppose you only want Linux, DNS, and firewall events:
+---
+
+# 8. `where` for an allow list
+
+Suppose only these event types are useful:
+
+```text
+linux
+dns
+firewall
+```
+
+Then:
 
 ```spl
 | where profile IN ("linux", "dns", "firewall")
 ```
 
-Everything else is dropped.
+Data flow:
 
-This is often much easier to reason about than writing several negative conditions.
+```text
+linux       -> KEEP
+dns         -> KEEP
+firewall    -> KEEP
+windows     -> DROP
+test        -> DROP
+unknown     -> DROP
+```
+
+This is a good pattern when you know exactly what you want to retain.
 
 ---
 
-# 7. When should you filter before extracting?
+# 9. `where` before expensive processing
 
-Suppose your event is:
+Consider this:
 
-```json
-{"profile":"linux","action":"login","user":"teja","password":"Secret123"}
+```spl
+| rex ...
+| rex ...
+| spath ...
+| eval ...
+| eval ...
+| where action != "debug"
 ```
 
-At the beginning you may only have:
+A debug event receives all that processing before being removed.
+
+If the debug condition can be identified reliably from the raw event, a better design can be:
+
+```spl
+| where NOT match(_raw, /"action"\s*:\s*"debug"/i)
+| rex ...
+| spath ...
+| eval ...
+```
+
+Now the unwanted event is removed before the later processing.
+
+The principle is:
 
 ```text
-_raw
+cheap high-value filtering
+        |
+        v
+more expensive processing
 ```
 
-If your drop rule can be determined cheaply from `_raw`, you can filter without creating a temporary field.
+But do not force every filter into a complicated regex. If a field is already available, use the field.
+
+---
+
+# 10. Partition versus `where`
+
+These are different.
+
+## Partition
+
+Configured in the Edge Processor builder.
+
+Question:
+
+> What subset should this pipeline process?
+
+Example:
+
+```text
+host = server01
+sourcetype = firewall
+```
+
+This defines the pipeline's input scope.
+
+## `where`
+
+Written in the pipeline.
+
+Question:
+
+> Which events inside this pipeline should continue?
 
 Example:
 
 ```spl
-| where NOT match(_raw, /"action"\s*:\s*"debug"/i)
+| where action != "debug"
 ```
 
-Then extract only what survives:
-
-```spl
-| rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
-```
-
-That is useful when:
+So:
 
 ```text
-30% debug logs
-70% useful logs
+PARTITION
+"Which data enters this pipeline?"
+
+WHERE
+"Which events continue inside this pipeline?"
 ```
 
-because the extraction and later transformations are not run on the dropped 30%.
-
-But do not turn every filter into a giant regex just for performance. If a field is already available, use the field directly. If a structured field is needed later anyway, extracting it once can be clearer and cheaper than repeatedly searching `_raw`.
+Current Splunk documentation explicitly separates partition configuration from pipeline filtering. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/filter-and-mask-data-using-an-edge-processor)
 
 ---
 
-# 8. `rex`: extract fields from raw data
+# 11. Important current behavior of `where`
+
+Splunk changed how `where` clauses immediately following `from $source` are interpreted.
+
+Before the January 22, 2024 update, some such clauses were treated as partition conditions.
+
+Current Edge Processor behavior treats these as filters in the pipeline body, so excluded data is dropped rather than being automatically sent to the default destination. Splunk recommends moving intended partition conditions into the partition configuration. [Official troubleshooting documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/troubleshooting/troubleshoot-the-edge-processor-solution)
+
+Therefore, do not rely on:
+
+```spl
+$pipeline = | from $source
+    | where host="server01"
+```
+
+as a substitute for configuring the pipeline partition.
+
+Configure:
+
+```text
+Partition:
+host = server01
+```
+
+in the builder.
+
+Then use pipeline-level `where` for actual event filtering.
+
+---
+
+# 12. `rex` — extract values from `_raw`
 
 Suppose:
 
 ```text
-_raw = {"profile":"linux","action":"login","user":"teja"}
+_raw = {"profile":"linux","action":"login"}
 ```
 
 Use:
@@ -437,14 +513,14 @@ Use:
 | rex field=_raw /"profile":"(?P<profile>[^"]+)"/
 ```
 
-The result is conceptually:
+Now conceptually:
 
 ```text
-_raw      = {"profile":"linux","action":"login","user":"teja"}
-profile   = linux
+_raw
+profile = linux
 ```
 
-Now you can write:
+The field can be used later:
 
 ```spl
 | where profile == "linux"
@@ -458,36 +534,19 @@ or:
 ]
 ```
 
-A key principle:
-
-```text
-RAW DATA
-   |
-   v
-rex / spath
-   |
-   v
-FIELD
-   |
-   +--> where
-   +--> route
-   +--> if
-   +--> dedup
-   +--> lookup
-```
+Splunk's Edge Processor documentation uses this workflow: extract the value into a field and then use the extracted field for filtering/routing. [Official documentation](https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/filter-and-mask-data-using-an-edge-processor)
 
 ---
 
-# 9. `spath`: prefer structured parsing when appropriate
+# 13. `spath` — structured extraction
 
-If the event is genuinely JSON or XML, `spath` can be more appropriate than manually maintaining many regular expressions.
+If the event is structured JSON/XML, consider `spath`.
 
-For example:
+Example:
 
 ```json
 {
   "profile": "linux",
-  "action": "login",
   "user": {
     "name": "teja",
     "role": "admin"
@@ -495,41 +554,39 @@ For example:
 }
 ```
 
-You may extract structured values using `spath`.
+The purpose of `spath` is to work with structured data rather than manually writing regular expressions for every field.
 
-The important decision is:
+Use:
 
 ```text
-Plain/unstructured text
-    -> rex is often useful
+rex
+    for regex-oriented extraction
 
-JSON/XML structured data
-    -> spath is often preferable
+spath
+    for structured JSON/XML extraction
 ```
 
-Do not use regular expressions for structured parsing merely because regex can technically do it.
+Do not use regex for structured parsing just because regex can technically parse it.
 
 ---
 
-# 10. Masking: where should it happen?
+# 14. `eval` — create or change fields
 
-Your requirement is:
-
-> Mask sensitive information globally before routing.
-
-That is a sound design.
-
-For example:
+Examples:
 
 ```spl
-| eval _raw=replace(
-    _raw,
-    /"password":"[^"]*"/,
-    "\"password\":\"xxxxxxxx\""
-)
+| eval severity="high"
 ```
 
-And:
+```spl
+| eval total_bytes = bytes_in + bytes_out
+```
+
+```spl
+| eval category = if(status >= 500, "server_error", "normal")
+```
+
+Your masking pattern is also `eval`:
 
 ```spl
 | eval _raw=replace(
@@ -539,62 +596,33 @@ And:
 )
 ```
 
-The basic design should be:
-
-```text
-receive
-   |
-   v
-early DROP
-   |
-   v
-required extraction
-   |
-   v
-GLOBAL MASKING
-   |
-   v
-routing / copying
-   |
-   v
-destinations
-```
-
-### Why mask before `branch` or `thru`?
-
-Suppose you have:
-
-```text
-password=Secret123
-```
-
-and then:
-
-```spl
-| branch
-    [
-        | into $splunk_destination
-    ],
-    [
-        | into $archive_destination
-    ];
-```
-
-Both paths get the sensitive value.
-
-If you mask first:
-
-```text
-password=xxxxxxxx
-```
-
-then every copy inherits the sanitized event.
-
-This is especially important when one destination has a different trust boundary [security boundary or access level] from another.
-
 ---
 
-# 11. Your masking regex: use the data format to guide the regex
+# 15. `replace()` — mask or rewrite text
+
+The `replace()` function is used inside `eval`.
+
+Example:
+
+```spl
+| eval _raw=replace(
+    _raw,
+    /CreditCard=[0-9]+/,
+    "CreditCard=XXXXXXXXXXX"
+)
+```
+
+Input:
+
+```text
+user=teja CreditCard=4111111111111111
+```
+
+Output:
+
+```text
+user=teja CreditCard=XXXXXXXXXXX
+```
 
 For JSON:
 
@@ -606,45 +634,25 @@ For JSON:
 )
 ```
 
-This is usually more general than:
+Input:
 
-```regex
-[A-Za-z0-9_@!-]+
+```json
+{"user":"teja","password":"Secret123"}
 ```
 
-because a real password may contain characters such as:
+Output:
 
-```text
-$
-%
-#
-&
-*
-(
-)
-[
-]
-{
-}
-=
-+
-?
-/
+```json
+{"user":"teja","password":"xxxxxxxx"}
 ```
 
-If your requirement is:
+Keep the field name unchanged when the goal is masking only.
 
-> replace everything between the JSON quotes,
+---
 
-then:
+# 16. Your current masking rule has a correction
 
-```regex
-[^"]*
-```
-
-directly expresses that requirement.
-
-Likewise, your original rule:
+You currently have:
 
 ```spl
 | eval _raw=replace(
@@ -654,9 +662,21 @@ Likewise, your original rule:
 )
 ```
 
-changes the field name as well as the value.
+This changes:
 
-If the goal is only masking, preserve the field name:
+```text
+"credit_card":"123456789"
+```
+
+into:
+
+```text
+card_number=XXXXXXXXXXX
+```
+
+That changes the structure as well as the value.
+
+If you only want masking:
 
 ```spl
 | eval _raw=replace(
@@ -666,20 +686,45 @@ If the goal is only masking, preserve the field name:
 )
 ```
 
----
+Now:
 
-# 12. `route`: move a subset to a different path
-
-Use:
-
-```spl
-| route <condition>, [
-    | into $destination2
-]
-| into $destination
+```text
+"credit_card":"123456789"
 ```
 
-Example:
+becomes:
+
+```text
+"credit_card":"XXXXXXXXXXX"
+```
+
+---
+
+# 17. `route` — send a subset down another path
+
+Use `route` when your question is:
+
+> Does this subset need a different path or destination?
+
+Syntax:
+
+```spl
+| route <predicate>, [
+    | into $destination2
+]
+```
+
+Splunk's current documentation gives the syntax:
+
+```spl
+| route <predicate>, [ | into $destination2 ]
+```
+
+and explains that `route` creates an additional path, selects a subset, and diverts that subset to the new path. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/route-data-using-pipelines/process-a-subset-of-data-using-an-edge-processor)
+
+---
+
+# 18. Example: Linux to another destination
 
 ```spl
 | route profile == "linux", [
@@ -688,29 +733,29 @@ Example:
 | into $default_destination;
 ```
 
-Conceptually:
+Data flow:
 
 ```text
-                 events
-                   |
-                 route
-                /     \
-             linux    other
-               |         |
-               v         v
-            linux      default
-          destination destination
+              events
+                |
+              route
+             /     \
+         linux     other
+           |         |
+           v         v
+        linux      default
+      destination destination
 ```
 
-The Linux events are diverted to the additional path.
+The Linux subset is diverted.
 
-The remaining events continue down the main pipeline.
+The other events continue through the main path.
 
 ---
 
-# 13. Multiple `route` commands
+# 19. Multiple `route` commands
 
-This is exactly the pattern you are using.
+For your use case:
 
 ```spl
 | route profile == "linux", [
@@ -728,7 +773,7 @@ This is exactly the pattern you are using.
 | into $default_destination;
 ```
 
-Data flow:
+Flow:
 
 ```text
 ALL
@@ -746,56 +791,44 @@ ALL
                +--> remaining --> default_destination
 ```
 
-The important property is that matching data is diverted and does not then continue through the later main-path routes.
+Splunk explicitly documents that `route`, `thru`, and `branch` can be used multiple times and can be nested or sequential. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/route-data-using-pipelines/routing-data-in-the-same-edge-processor-pipeline-to-different-actions-and-destinations)
 
 ---
 
-# 14. `route` versus `where`
+# 20. Important correction in your current pipeline: `index=linux`
 
-This distinction should be memorized.
-
-## `where`
+You wrote:
 
 ```spl
-| where profile == "linux"
+| eval index=linux
 ```
 
-Means:
-
-```text
-Linux  -> KEEP
-Other  -> DROP
-```
-
-## `route`
+Use:
 
 ```spl
-| route profile == "linux", [
-    | into $linux_destination
+| eval index="linux"
+```
+
+because `linux` here is intended to be a literal string value.
+
+For example:
+
+```spl
+| route profileTest == "linux", [
+    | eval index="linux"
+    | into $destination2
 ]
-| into $destination;
 ```
 
-Means:
-
-```text
-Linux  -> linux_destination
-Other  -> destination
-```
-
-Therefore:
-
-```text
-where = decide which events survive
-
-route = decide where a subset goes
-```
+This is the clearer and correct form for assigning a literal index name.
 
 ---
 
-# 15. `thru`: copy AND continue
+# 21. `thru` — make an additional copy and continue
 
-Use `thru` when you want an additional copy of the data while the original path continues.
+Use `thru` when you want:
+
+> An extra copy goes somewhere, but the original event continues through the main path.
 
 Example:
 
@@ -803,83 +836,79 @@ Example:
 | thru [
     | into $archive_destination
 ]
-| into $splunk_destination;
+| into $main_destination;
 ```
 
-Data flow:
+Flow:
 
 ```text
                  event
                    |
                   thru
-               /       \
-            COPY      ORIGINAL
-              |           |
-              v           v
-          archive      continue
+                /     \
+             COPY     ORIGINAL
+               |          |
+               v          v
+            archive     continue
                            |
                            v
-                       splunk
+                         main
 ```
 
-So:
-
-```text
-thru = "make one extra copy and keep going"
-```
+Splunk describes `thru` as creating an additional path, sending a complete copy there, and allowing the original data to continue downstream. [Official documentation](https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/route-data-using-pipelines/process-a-copy-of-data-using-an-edge-processor)
 
 ---
 
-# 16. `thru` placement matters
+# 22. The position of `thru` is important
 
-Compare these two designs.
-
-## Design A
+Consider:
 
 ```spl
 | mask
 | thru [
     | into $archive
 ]
-| route ...
+| route profile == "linux", [...]
 ```
 
-The archive receives all events that survived the mask stage.
+The archive receives the events after masking and before routing.
+
+Conceptually:
 
 ```text
 mask
  |
  +--> archive
  |
- +--> route
+ +--> routes
 ```
 
-## Design B
+Now compare:
 
 ```spl
 | mask
-| route profile == "linux", [
-    | into $linux
-]
+| route profile == "linux", [...]
 | thru [
     | into $archive
 ]
 | into $default;
 ```
 
-Now the archive only receives the events that remain after the Linux route.
+Now Linux events have already been diverted.
 
-The Linux events were already diverted.
+The `thru` only sees the remaining main-path data.
 
 Therefore:
 
-> **The location of `thru` determines which population it copies.**
+> A `thru` copies whatever reaches the point where `thru` is placed.
 
 ---
 
-# 17. `branch`: multiple complete copies
+# 23. `branch` — create multiple complete paths
 
-`branch` is for multiple independent paths.
+Use `branch` when you want:
+
+> Every event entering the branch should be copied into multiple independent paths.
 
 Example:
 
@@ -887,101 +916,109 @@ Example:
 $pipeline = | from $source
     | branch
         [
-            | eval environment="production"
             | into $destination1
         ],
         [
-            | eval environment="archive"
             | into $destination2
         ];
 ```
 
-The incoming data is copied into both paths.
-
-Conceptually:
+Flow:
 
 ```text
-                   ALL EVENTS
-                       |
-                    branch
-                  /        \
-                 /          \
-                v            v
-          production      archive
-             path           path
+              ALL EVENTS
+                   |
+                branch
+               /      \
+              /        \
+             v          v
+         destination1 destination2
 ```
 
-Every branch receives a complete copy of the incoming data.
+Splunk documents that `branch` creates two or more paths and sends a complete copy of the data to each path. [Official documentation](https://help.splunk.com/en/splunk-enterprise/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.2/route-data-using-pipelines/process-multiple-copies-of-data-using-an-edge-processor)
 
 ---
 
-# 18. `branch` versus `thru`
+# 24. `route` vs `thru` vs `branch`
 
-This is a common source of confusion.
+| Command | Event flow | Use it when |
+|---|---|---|
+| `route` | Diverts matching subset | A subset belongs on another path |
+| `thru` | Copies the current stream and original continues | You need an extra copy |
+| `branch` | Copies the whole input into multiple paths | You need multiple independent full paths |
 
-## `thru`
+Remember:
 
 ```text
-original path remains
-       +
-one additional copy
+route
+    subset -> another path
+
+thru
+    copy + original continues
+
+branch
+    every event -> multiple paths
 ```
 
-Example:
+---
+
+# 25. Example: route + thru
+
+Suppose:
+
+> Linux events go to the Linux destination. Other events stay on the main path. Also archive the remaining main-path data.
 
 ```spl
-| thru [
-    | into $archive
+| route profile == "linux", [
+    | into $linux_destination
 ]
-| into $main;
+
+| thru [
+    | into $archive_destination
+]
+
+| into $default_destination;
 ```
 
-## `branch`
+Flow:
 
 ```text
-multiple complete independent paths
+ALL
+ |
+route linux
+ |\
+ | \ 
+ |  +---- remaining
+ |
+ +---- Linux -> linux_destination
+
+remaining
+    |
+   thru
+  /    \
+copy   original
+ |         |
+ v         v
+archive   default
 ```
+
+This example is useful because it shows that `thru` acts on the data that reaches it.
+
+---
+
+# 26. `branch` + `route`
+
+A common advanced pattern is:
+
+> Create a sanitized copy for the archive, while another copy is independently routed.
 
 Example:
 
 ```spl
-| branch
-    [
-        | into $destination1
-    ],
-    [
-        | into $destination2
-    ];
-```
+import route from /splunk/ingest/commands
 
-A useful mental shortcut:
-
-```text
-route  = divert a subset
-
-thru   = copy one path and continue original
-
-branch = duplicate the entire input into multiple paths
-```
-
-Splunk documents that `route`, `thru`, and `branch` can be combined and used multiple times in the same pipeline.
-
----
-
-# 19. A powerful real-world pattern: branch + route
-
-Suppose you want:
-
-1. All data masked.
-2. One complete sanitized copy archived.
-3. Another sanitized copy routed to different Splunk destinations.
-
-A good structure is:
-
-```spl
 $pipeline = | from $source
 
-    /* Global masking */
     | eval _raw=replace(
         _raw,
         /"password":"[^"]*"/,
@@ -992,7 +1029,6 @@ $pipeline = | from $source
 
     | branch
         [
-            /* Main processing copy */
             | route profile == "linux", [
                 | into $linux_destination
             ]
@@ -1002,72 +1038,71 @@ $pipeline = | from $source
             | into $default_destination
         ],
         [
-            /* Archive copy */
             | into $archive_destination
         ];
 ```
 
-Data flow:
+Flow:
 
 ```text
-                 masked events
-                      |
-                   branch
-                  /      \
-                 /        \
-                v          v
-            MAIN COPY    ARCHIVE COPY
-                |
-              route
-            /   |   \
-         linux dns  other
-           |    |     |
-           v    v     v
-         dest  dest  default
+                 MASKED DATA
+                     |
+                  branch
+                 /      \
+                /        \
+               v          v
+          MAIN COPY    ARCHIVE COPY
+             |
+           route
+          /   |   \
+       linux dns  other
 ```
 
-This is a strong pattern when the requirement really is "copy the full sanitized stream and independently process another copy."
+Because masking happens before the branch, both copies contain the masked version.
 
 ---
 
-# 20. `dedup`: remove duplicate events
+# 27. `dedup` — remove duplicate events
 
-`dedup` is NOT a routing command.
+`dedup` answers a different question:
 
-It reduces the event set by removing events that have the same combination of values for the fields you specify.
+> Have I already seen an event with this same field-value combination?
 
 Example:
 
 ```spl
-| dedup host
+| dedup event_id
 ```
 
 Input:
 
 ```text
-host=server1 action=login
-host=server1 action=logout
-host=server1 action=login
-host=server2 action=query
-host=server2 action=query
+event_id=1001
+event_id=1001
+event_id=1002
+event_id=1003
+event_id=1003
 ```
 
 Result:
 
 ```text
-host=server1 action=login
-host=server2 action=query
+event_id=1001
+event_id=1002
+event_id=1003
 ```
 
-Only one event per host remains.
+The current SPL2 `dedup` documentation defines duplicate identity from the specified fields.
 
-## Multiple fields
+---
+
+# 28. Multiple-field `dedup`
 
 ```spl
 | dedup host, action
 ```
 
-Now uniqueness is based on:
+Uniqueness is based on:
 
 ```text
 host + action
@@ -1077,10 +1112,10 @@ Example:
 
 ```text
 server1 + login
-server1 + logout
 server1 + login
-server2 + query
-server2 + query
+server1 + logout
+server2 + login
+server2 + login
 ```
 
 becomes:
@@ -1088,34 +1123,14 @@ becomes:
 ```text
 server1 + login
 server1 + logout
-server2 + query
+server2 + login
 ```
-
-### Important current SPL2 syntax
-
-In SPL2 the fields are comma-delimited:
-
-```spl
-| dedup host, action
-```
-
-not:
-
-```spl
-| dedup host action
-```
-
-Options, when used, come before the field list.
-
-Splunk's current documentation also warns against deduplicating large volumes of `_raw`, because keeping the complete event text in memory can affect performance.
 
 ---
 
-# 21. When should you use `dedup`?
+# 29. Choose the dedup key carefully
 
-Use it when you have a meaningful identifier or combination that actually represents a duplicate.
-
-Good candidates:
+Good candidates include identifiers such as:
 
 ```text
 event_id
@@ -1124,199 +1139,158 @@ transaction_id
 message_id
 ```
 
-For example:
-
-```spl
-| dedup request_id
-```
-
-Potentially useful:
-
-```spl
-| dedup host, action
-```
-
-but only if your definition of duplicate really is:
-
-> same host AND same action.
-
-Do NOT blindly write:
-
-```spl
-| dedup _raw
-```
-
-for high-volume data.
-
-Also be careful with:
+Bad generic choice:
 
 ```spl
 | dedup host
 ```
 
-because that literally means:
+unless your actual requirement is:
 
-> keep only one event per host.
+> Keep only one event for every host.
 
-That would destroy legitimate events from the same host.
+Otherwise you could discard legitimate events.
+
+Also be cautious with:
+
+```spl
+| dedup _raw
+```
+
+on large streams. The event text itself may need to be retained for duplicate detection, which can increase memory use.
 
 ---
 
-# 22. Deduplication order
+# 30. Do not dedup after masking if `_raw` defines uniqueness
 
 Suppose:
 
 ```text
-Event A:
-password=Secret123
-request_id=1001
-
-Event B:
-password=Secret999
-request_id=1001
+request_id=1001 password=ABC
+request_id=1001 password=XYZ
 ```
 
-If the actual duplicate identity is `request_id`, then:
+After masking:
+
+```text
+request_id=1001 password=XXXX
+request_id=1001 password=XXXX
+```
+
+The events become even more similar.
+
+Therefore, if you have a real identifier:
 
 ```spl
 | dedup request_id
 ```
 
-is sensible.
+is normally better than:
 
-But if you mask first:
-
-```text
-Event A:
-password=xxxxxxxx
-request_id=1001
-
-Event B:
-password=xxxxxxxx
-request_id=1001
+```spl
+| dedup _raw
 ```
-
-the two events become even more similar.
-
-This is one more reason to deduplicate using a real event identifier instead of `_raw`.
 
 ---
 
-# 23. `stats`: aggregation rather than ordinary filtering
+# 31. `stats` — summarize events
 
-`stats` does something very different.
+`stats` is not ordinary filtering.
 
-Suppose:
+It combines many events into aggregate results.
 
-```text
-host=server1 bytes=100
-host=server1 bytes=200
-host=server1 bytes=300
-host=server2 bytes=500
-```
-
-Run:
+Example:
 
 ```spl
-| stats sum(bytes) AS total_bytes BY host
+| stats count() BY profile
+```
+
+Input:
+
+```text
+linux
+linux
+linux
+dns
+dns
+firewall
 ```
 
 Result:
 
 ```text
-server1   600
-server2   500
+profile      count
+linux          3
+dns            2
+firewall       1
 ```
 
-You started with four events and emitted two aggregated results.
+You no longer have the original six events.
 
-That means:
+You have summary results.
+
+Current Edge Processor documentation specifically describes aggregation as a way to reduce event volume. [Official documentation](https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/aggregate-event-data-using-edge-processor)
+
+---
+
+# 32. `dedup` vs `stats`
 
 ```text
 dedup
-    removes duplicate events
+    remove duplicate events
 
 stats
-    combines many events into summarized results
+    combine many events into summaries
 ```
-
-Current Edge Processor aggregation support includes:
-
-```text
-count
-max
-min
-sum
-```
-
-and `span` for grouping by time. Edge Processor aggregation also supports state-window controls such as `@maxdelay` and `@maxdisk`.
 
 Example:
 
 ```spl
-$pipeline = | from $source
-    | @maxdelay("10m")
-    | @maxdisk("1GB")
-    | stats sum(bytes_out) BY server_name
-    | into $destination;
+| dedup request_id
 ```
 
-The precise aggregation behavior is different from search-time `stats`; Edge Processor aggregates continuously streaming data inside a state window and emits aggregation results.
-
-Also note that `avg` is not directly supported as an Edge Processor statistical function. A documented approach is to aggregate `sum` and `count`, then calculate the average later.
-
----
-
-# 24. When should `stats` be used?
-
-Use `stats` when your downstream use case does not require every original event.
+keeps a representative event for each duplicate key.
 
 Example:
 
-You receive:
-
-```text
-1,000,000 flow records
+```spl
+| stats count() BY host
 ```
 
-but the downstream requirement is:
-
-```text
-bytes by host per time period
-```
-
-Then sending every raw flow record may be unnecessary.
-
-An aggregation can reduce the number of events sent downstream.
-
-But do NOT use `stats` if your SOC investigation requires individual events.
-
-For example:
-
-```text
-authentication events
-process creation events
-network connection events
-file execution events
-```
-
-often need their original detail for investigation and detection.
-
-So:
-
-```text
-Need original events?
-    -> do not aggregate away the evidence.
-
-Need only a metric/summary?
-    -> stats can reduce volume.
-```
+creates a new summary result for each host.
 
 ---
 
-# 25. `if`: conditional processing
+# 33. When should you use `stats`?
 
-The current SPL2 `if` command provides if/elseif/else processing.
+Use it when the downstream system needs a summary rather than every raw event.
+
+Example:
+
+```text
+Need:
+"bytes sent by host"
+
+Do:
+stats sum(bytes) BY host
+```
+
+Do not use it when the SOC needs individual evidence such as:
+
+```text
+authentication event
+process creation event
+network connection event
+file creation event
+```
+
+unless you intentionally want only aggregated information.
+
+---
+
+# 34. `if` — conditional processing
+
+`if` is useful when you want different processing but do not necessarily need separate destinations.
 
 Example:
 
@@ -1336,96 +1310,59 @@ else [
 | into $destination;
 ```
 
-Here the events are not necessarily going to different destinations.
-
-Instead, you are changing the event:
+Conceptually:
 
 ```text
-linux     -> index=linux
-dns       -> index=dns
-firewall  -> index=firewall
-other     -> index=other
+               all events
+                   |
+                   v
+                  if
+              /    |    \
+           linux  dns  firewall
+             |     |      |
+             +-----+------+
+                    |
+                    v
+              same destination
 ```
 
-and then all events go to:
+The event is being processed differently, not necessarily sent through a different destination.
+
+Splunk documents the current SPL2 `if` command as conditional processing with `if`, `elseif`, and `else` paths. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/if-command/if-command-overview-syntax-and-usage)
+
+---
+
+# 35. `if` vs `route`
+
+Use `if` when you want:
 
 ```text
-$destination
+"How should this event be changed?"
 ```
 
-This is different from:
+Use `route` when you want:
+
+```text
+"Where should this subset go?"
+```
+
+Example:
 
 ```spl
-| route ...
+if profile == "linux"
+    -> eval index="linux"
 ```
 
-which creates a separate path and destination.
+versus:
 
-Think:
-
-```text
-if
-    "How should I process this event?"
-
-route
-    "Where should this subset go?"
+```spl
+route profile == "linux"
+    -> into $linux_destination
 ```
 
 ---
 
-# 26. `eval`: modify the event
-
-Examples:
-
-```spl
-| eval severity="high"
-```
-
-```spl
-| eval total_bytes=bytes_in + bytes_out
-```
-
-```spl
-| eval category=if(status >= 500, "server_error", "normal")
-```
-
-You are using `eval` for masking:
-
-```spl
-| eval _raw=replace(...)
-```
-
-That is valid because `replace()` is an evaluation function used inside `eval`.
-
----
-
-# 27. `replace()` versus `replace`
-
-These are different.
-
-## `replace()` function
-
-Used inside `eval`:
-
-```spl
-| eval _raw=replace(
-    _raw,
-    /CreditCard=[0-9]+/,
-    "CreditCard=XXXXXXXXXXX"
-)
-```
-
-This modifies text inside the field.
-
-## `replace` command
-
-The SPL2 `replace` command is a different command for replacing field values.
-
-For your raw-data masking use case, you are correctly using the `replace()` function inside `eval`.
-
----
-
-# 28. `fields`: remove fields, NOT events
+# 36. `fields` — remove fields, not events
 
 Example:
 
@@ -1433,9 +1370,7 @@ Example:
 | fields - profile, action
 ```
 
-The event remains.
-
-Only the fields are removed.
+This does not remove the event.
 
 Before:
 
@@ -1453,50 +1388,41 @@ _raw
 host
 ```
 
-Therefore:
+So:
 
 ```text
 where
-    removes EVENTS
+    removes unwanted EVENTS from the continuing pipeline
 
 fields
-    removes FIELDS
+    removes unwanted FIELDS from an event
 ```
-
-This is a very important distinction.
 
 ---
 
-# 29. Why remove temporary fields?
+# 37. Temporary field cleanup
 
-Suppose you do:
+You might extract a field only for routing:
 
 ```spl
 | rex field=_raw /"profile":"(?P<profile>[^"]+)"/
+```
+
+and then use:
+
+```spl
 | route profile == "linux", [
-    | into $linux
+    | ...
 ]
 ```
 
-If `profile` was only a temporary field used for routing and does not need to be stored downstream, you can remove it on the appropriate path.
+If the field is not useful downstream, you can remove it on the appropriate path with `fields`.
 
-Conceptually:
-
-```text
-extract
-   |
-route
-   |
-fields -
-   |
-destination
-```
-
-This keeps the outgoing event cleaner.
+Do not remove it if the destination needs it.
 
 ---
 
-# 30. `rename`: change field names
+# 38. `rename` — change field names
 
 Example:
 
@@ -1504,25 +1430,25 @@ Example:
 | rename profileTest AS profile
 ```
 
-Multiple SPL2 renames are comma-separated:
+Multiple renames:
 
 ```spl
 | rename profileTest AS profile, action2 AS action
 ```
 
-Use this when the incoming field name is not the field name you want downstream.
+Use this when the field name should change without changing the underlying event meaning.
 
 ---
 
-# 31. `lookup`: enrichment
+# 39. `lookup` — enrich data
 
-Suppose you have:
+Suppose:
 
 ```text
 src_ip=10.10.10.20
 ```
 
-and a lookup dataset:
+A lookup dataset contains:
 
 ```text
 ip            asset_type
@@ -1530,14 +1456,14 @@ ip            asset_type
 10.10.10.30   firewall
 ```
 
-A lookup can enrich:
+A lookup can enrich the event:
 
 ```text
 src_ip=10.10.10.20
 asset_type=server
 ```
 
-Then you can route based on the result:
+Then:
 
 ```text
 src_ip
@@ -1549,78 +1475,64 @@ asset_type
 route
 ```
 
-This is useful when the raw event itself does not contain the business/security classification you need.
+This is useful when the classification needed for routing is not present in the original event.
 
-The lookup dataset must be imported into the Edge Processor pipeline before using the `lookup` command.
+The lookup dataset has to be imported/configured for the pipeline. [Official documentation](https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/working-with-pipelines/edge-processor-pipeline-syntax)
 
 ---
 
-# 32. `decrypt`
-
-Use this only when data is already encrypted and the pipeline needs to decrypt a field.
+# 40. `decrypt`
 
 Conceptually:
 
 ```text
 encrypted field
-       |
-       v
-     decrypt
-       |
-       v
-decrypted value
-       |
-       v
+      |
+      v
+   decrypt
+      |
+      v
+decrypted field
+      |
+      v
 mask / transform / route
 ```
 
-Splunk documents private-key handling through the lookup mechanism for this command.
+This is a specialized command for data that is already encrypted.
 
-This is specialized processing, not ordinary parsing.
+It is not a general-purpose encryption command.
 
 ---
 
-# 33. `ocsf`
+# 41. `ocsf`
 
-`ocsf` converts supported event data into the Open Cybersecurity Schema Framework format.
+`ocsf` is for converting supported event data into the Open Cybersecurity Schema Framework structure.
 
 Conceptually:
 
 ```text
-vendor event
-     |
-     v
-  ocsf
-     |
-     v
+vendor-specific event
+        |
+        v
+      ocsf
+        |
+        v
 normalized security event
 ```
 
-This is useful when different products represent similar security activity using different field names.
-
-For example:
-
-```text
-vendor field A
-vendor field B
-vendor field C
-```
-
-can be transformed toward a common security schema.
-
-Use it when your downstream architecture benefits from standardized event structure; do not apply it automatically to everything simply because it exists.
+Use it when you have a real need for schema normalization [using a common field structure].
 
 ---
 
-# 34. `expand`, `flatten`, and `mvexpand`
+# 42. `expand`, `flatten`, `mvexpand`
 
-These are easy to confuse.
+These are structural commands and should not be confused.
 
 ## `expand`
 
-For arrays of objects.
+Used for arrays of objects.
 
-Example concept:
+Concept:
 
 ```json
 [
@@ -1629,11 +1541,11 @@ Example concept:
 ]
 ```
 
-`expand` operates on that array structure.
-
 ## `flatten`
 
-For an object:
+Used to promote first-level object values into fields.
+
+Concept:
 
 ```text
 {
@@ -1642,275 +1554,1104 @@ For an object:
 }
 ```
 
-and promotes first-level key/value pairs into fields:
+becomes conceptually:
 
 ```text
-name = server01
-ip   = 10.0.0.1
+name=server01
+ip=10.0.0.1
 ```
 
 ## `mvexpand`
 
-For a multivalue field.
+Works on multivalue fields.
 
-Example:
+Concept:
 
 ```text
-iplist =
-10.0.0.1
-10.0.0.2
-10.0.0.3
+iplist = 10.0.0.1, 10.0.0.2, 10.0.0.3
 ```
 
-```spl
-| mvexpand iplist
-```
-
-can produce separate results for the values.
+can become separate results.
 
 Mental model:
 
 ```text
 expand
-    array of objects -> expanded results
+    array/object structure -> expanded results
 
 flatten
     object -> fields
 
 mvexpand
-    multivalue field -> multiple events
+    multivalue field -> multiple results
 ```
 
 ---
 
-# 35. Destination: do not confuse DESTINATION with INDEX
+# 43. A complete pipeline design for your current use case
 
-This matters a lot in your lab.
+Requirement:
 
-A pipeline destination is the **endpoint** to which the Edge Processor sends the processed data.
+> 1. Select the correct broad data set for the pipeline.
+> 2. Drop unwanted events early.
+> 3. Extract routing fields.
+> 4. Deduplicate only when a real duplicate key exists.
+> 5. Mask sensitive values.
+> 6. Route Linux, DNS, and Firewall separately.
+> 7. Send everything else to a default destination.
 
-An index is where the data is stored in the Splunk platform deployment.
-
-You might have:
-
-```text
-one Splunk destination
-    |
-    +--> linux index
-    +--> dns index
-    +--> firewall index
-```
-
-or:
-
-```text
-destination A -> Splunk deployment A
-destination B -> Splunk deployment B
-destination C -> S3
-```
-
-These are different levels.
-
----
-
-# 36. Best destination strategy
-
-## Case 1 — same Splunk deployment, different indexes
-
-Often you do NOT need a separate destination just because you need a separate index.
-
-For example:
-
-```spl
-| route profile == "linux", [
-    | eval index="linux"
-    | into $splunk_destination
-]
-| route profile == "dns", [
-    | eval index="dns"
-    | into $splunk_destination
-]
-| into $splunk_destination;
-```
-
-This is conceptually:
-
-```text
-             ONE SPLUNK DESTINATION
-                    |
-          +---------+---------+
-          |         |         |
-        linux      dns      default
-        index      index
-```
-
-Whether the resulting index is selected from the event metadata, pipeline `eval`, or destination configuration depends on the documented index precedence for the protocol and setup you are using.
-
-## Case 2 — different systems
-
-Use separate destinations when data truly needs to go to different endpoints.
+### Step 1 — configure the partition in the builder
 
 Example:
 
 ```text
-Linux security events -> Splunk
-Archive copy          -> S3
-Application events    -> another Splunk deployment
+Partition:
+sourcetype = my_security_logs
 ```
 
-That is a genuine destination difference.
+That is configured in the Edge Processor UI.
 
----
-
-# 37. Index precedence matters
-
-For Splunk platform S2S and HEC destinations, Splunk documents an index precedence order.
-
-For S2S, configurations can include:
-
-1. Splunk platform routing configuration.
-2. The pipeline's `eval index="..."`.
-3. Index metadata already carried in the event.
-4. The deployment's default index.
-
-For HEC, the precedence chain differs and includes HEC destination/token/default-index settings.
-
-Therefore:
-
-> Do not assume that `eval index="linux"` is always the only thing controlling the final index.
-
-Check the actual destination protocol and precedence rules in your environment.
-
----
-
-# 38. Internal logs: destination choice matters
-
-Splunk documents that when routing internal logs to a Splunk platform deployment using S2S, the event metadata can preserve the intended index.
-
-That is useful because internal logs often already carry index metadata such as:
-
-```text
-_internal
-_audit
-_introspection
-```
-
-For these cases, a Splunk platform S2S destination can be preferable when your intention is to preserve the original index metadata.
-
----
-
-# 39. The best high-volume design principle
-
-Your eBPF idea can be converted into this Edge Processor rule:
-
-> **Remove data as early as you safely can, and do expensive transformations only on data you still need.**
-
-But "early" must respect the available fields.
-
-A practical order is:
-
-```text
-1. PARTITION
-   define the broad population
-
-2. EARLY WHERE
-   drop clearly unwanted events
-
-3. MINIMAL EXTRACTION
-   create only the fields needed for decisions
-
-4. DEDUP, if there is a legitimate duplicate key
-
-5. MASK
-   sanitize data before any copy/output
-
-6. TRANSFORM / ENRICH
-   eval / rename / lookup / ocsf
-
-7. AGGREGATE, if detailed events are not required
-   stats
-
-8. ROUTE
-   route subsets
-
-9. COPY
-   thru / branch when required
-
-10. INTO
-   send the final data
-```
-
-This is a design principle, not a mandatory command order.
-
----
-
-# 40. Why masking is sometimes BEFORE filtering
-
-There is a security trade-off.
-
-Suppose your filter condition requires a sensitive field:
-
-```text
-password
-```
-
-If you only need to decide whether the field exists:
-
-```spl
-| where match(_raw, /"password"\s*:/)
-```
-
-then you may not need to expose its value to a field extraction.
-
-If the condition itself depends on a sensitive value, think carefully before extracting that value into a new field.
-
-A good principle is:
-
-```text
-Use the minimum sensitive data necessary to make the decision.
-```
-
----
-
-# 41. A complete pipeline matching your lab
-
-Below is a cleaner version of the pipeline you have been building.
+### Step 2 — pipeline
 
 ```spl
 import route from /splunk/ingest/commands
 
 $pipeline = | from $source
 
-    /* ==========================================
+    /* 1. Early filtering */
+    | where NOT match(_raw, /"action"\s*:\s*"debug"/i)
+    | where NOT match(_raw, /"profile"\s*:\s*"test"/i)
+
+    /* 2. Extract only what is needed */
+    | rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
+    | rex field=_raw /"action"\s*:\s*"(?P<action>[^"]+)"/
+
+    /* 3. Dedup only if the event has a real duplicate key */
+    /* | dedup request_id */
+
+    /* 4. Global masking */
+    | eval _raw=replace(
+        _raw,
+        /CreditCard=[0-9]+/,
+        "CreditCard=XXXXXXXXXXX"
+    )
+
+    | eval _raw=replace(
+        _raw,
+        /credit_card=[0-9]+/,
+        "credit_card=XXXXXXXXXXX"
+    )
+
+    | eval _raw=replace(
+        _raw,
+        /card_number=[0-9]+/,
+        "card_number=XXXXXXXXXXX"
+    )
+
+    | eval _raw=replace(
+        _raw,
+        /"credit_card":"[0-9]+"/,
+        "\"credit_card\":\"XXXXXXXXXXX\""
+    )
+
+    | eval _raw=replace(
+        _raw,
+        /"password":"[^"]*"/,
+        "\"password\":\"xxxxxxxx\""
+    )
+
+    | eval _raw=replace(
+        _raw,
+        /Password=[A-Za-z0-9_@!-]+/,
+        "Password=XXXXXXX"
+    )
+
+    | eval _raw=replace(
+        _raw,
+        /password=[A-Za-z0-9_@!-]+/,
+        "password=XXXXXXX"
+    )
+
+    /* 5. Linux */
+    | route profile == "linux", [
+        | eval index="linux"
+        | into $destination2
+    ]
+
+    /* 6. DNS */
+    | route profile == "dns", [
+        | eval index="dns"
+        | into $destination3
+    ]
+
+    /* 7. Firewall */
+    | route profile == "firewall", [
+        | eval index="firewall"
+        | into $destination4
+    ]
+
+    /* 8. Remaining events */
+    | into $destination;
+```
+
+---
+
+# 44. What happens to one event?
+
+Suppose the input is:
+
+```json
+{
+  "profile":"linux",
+  "action":"login",
+  "password":"Secret123",
+  "credit_card":"4111111111111111"
+}
+```
+
+### Stage 1 — partition
+
+The event must belong to the pipeline's configured partition.
+
+### Stage 2 — early filtering
+
+It is not:
+
+```text
+action=debug
+```
+
+so it survives.
+
+### Stage 3 — extraction
+
+The pipeline creates:
+
+```text
+profile=linux
+action=login
+```
+
+### Stage 4 — masking
+
+The event becomes:
+
+```json
+{
+  "profile":"linux",
+  "action":"login",
+  "password":"xxxxxxxx",
+  "credit_card":"XXXXXXXXXXX"
+}
+```
+
+### Stage 5 — routing
+
+```text
+profile == linux
+```
+
+is TRUE.
+
+Therefore the event is diverted to:
+
+```text
+$destination2
+```
+
+and does not continue down the later main-path routes.
+
+---
+
+# 45. What happens to a DNS event?
+
+Input:
+
+```json
+{
+  "profile":"dns",
+  "action":"query",
+  "password":"Secret123"
+}
+```
+
+After extraction:
+
+```text
+profile=dns
+```
+
+After masking:
+
+```text
+password=xxxxxxxx
+```
+
+First route:
+
+```text
+profile == linux
+```
+
+FALSE, so it remains on the main path.
+
+Second route:
+
+```text
+profile == dns
+```
+
+TRUE.
+
+Therefore:
+
+```text
+destination3
+```
+
+It is diverted there and does not reach the remaining main-path destination.
+
+---
+
+# 46. What happens to an unknown event?
+
+Input:
+
+```json
+{
+  "profile":"application",
+  "action":"login"
+}
+```
+
+Linux route:
+
+```text
+FALSE
+```
+
+DNS route:
+
+```text
+FALSE
+```
+
+Firewall route:
+
+```text
+FALSE
+```
+
+It reaches:
+
+```spl
+| into $destination
+```
+
+Therefore:
+
+```text
+unknown -> default destination
+```
+
+This is why you should normally have a clear default path.
+
+---
+
+# 47. Dropping a selected event class
+
+Suppose you want to drop:
+
+```text
+profile=test
+```
+
+and you can identify it from raw data.
+
+Use:
+
+```spl
+| where NOT match(_raw, /"profile"\s*:\s*"test"/i)
+```
+
+Then:
+
+```text
+test     -> DROP
+linux    -> continue
+dns      -> continue
+firewall -> continue
+```
+
+This is usually better than sending `test` to a destination you do not need.
+
+---
+
+# 48. Keeping only one class
+
+If you want:
+
+```text
+Linux -> keep
+Everything else -> drop
+```
+
+use:
+
+```spl
+| rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
+| where profile == "linux"
+| into $destination;
+```
+
+Do not use `route` unless you actually need another path.
+
+---
+
+# 49. Sending one class somewhere else
+
+If you want:
+
+```text
+Linux -> destination2
+Everything else -> destination
+```
+
+use:
+
+```spl
+| route profile == "linux", [
+    | into $destination2
+]
+| into $destination;
+```
+
+---
+
+# 50. Dropping one class but keeping another class on a separate destination
+
+Example:
+
+```text
+debug   -> DROP
+linux   -> destination2
+other   -> destination
+```
+
+A good design is:
+
+```spl
+| where NOT match(_raw, /"action"\s*:\s*"debug"/i)
+
+| rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
+
+| route profile == "linux", [
+    | into $destination2
+]
+
+| into $destination;
+```
+
+Flow:
+
+```text
+                 ALL EVENTS
+                     |
+                     v
+               drop debug
+                /       \
+             debug     remaining
+              |            |
+             DROP          route
+                         /       \
+                     linux       other
+                       |           |
+                       v           v
+                    dest2       dest
+```
+
+This is a very clean example of **filter first, route second**.
+
+---
+
+# 51. Global masking and routing
+
+Your original goal was:
+
+> Mask the data globally, then route by profile.
+
+A good design is:
+
+```text
+             partition
+                 |
+                 v
+          early filtering
+                 |
+                 v
+             extraction
+                 |
+                 v
+            global mask
+                 |
+                 v
+              routing
+```
+
+Why?
+
+Because the same sanitized [sensitive values replaced or removed] version is then used by every later path.
+
+---
+
+# 52. If an archive copy is required
+
+Use `thru`:
+
+```spl
+| eval _raw=replace(...)
+| thru [
+    | into $archive_destination
+]
+| route profile == "linux", [
+    | into $linux_destination
+]
+| into $default_destination;
+```
+
+Now the archive receives the masked event before routing changes which path receives it.
+
+---
+
+# 53. If multiple complete copies are required
+
+Use `branch`.
+
+Example:
+
+```spl
+| eval _raw=replace(...)
+| branch
+    [
+        | route profile == "linux", [
+            | into $linux_destination
+        ]
+        | into $default_destination
+    ],
+    [
+        | into $archive_destination
+    ];
+```
+
+Now:
+
+```text
+sanitized event
+      |
+   branch
+   /    \
+  /      \
+main    archive
+ |
+route
+```
+
+---
+
+# 54. Choosing the best command
+
+Use this decision table.
+
+| Requirement | Use |
+|---|---|
+| "Should this event remain?" | `where` |
+| "Remove duplicates?" | `dedup` |
+| "Turn many events into a summary?" | `stats` |
+| "Send this subset somewhere else?" | `route` |
+| "Make an extra copy and continue?" | `thru` |
+| "Create multiple complete paths?" | `branch` |
+| "Change a field/value?" | `eval` |
+| "Mask text in `_raw`?" | `eval` + `replace()` |
+| "Extract from raw text?" | `rex` |
+| "Parse structured JSON/XML?" | `spath` |
+| "Remove fields?" | `fields` |
+| "Rename fields?" | `rename` |
+| "Change processing based on condition?" | `if` |
+| "Add external information?" | `lookup` |
+| "Normalize supported data?" | `ocsf` |
+| "Decrypt supported data?" | `decrypt` |
+
+---
+
+# 55. Event-count thinking
+
+Another useful mental model is asking:
+
+> Does this command remove events, preserve them, or create copies?
+
+## Usually reduces the number of events
+
+```text
+where
+dedup
+stats
+```
+
+## Can create additional output/copies
+
+```text
+branch
+thru
+expand
+mvexpand
+```
+
+## Normally transforms the existing events
+
+```text
+eval
+replace
+rename
+fields
+rex
+spath
+if
+decrypt
+ocsf
+```
+
+## Changes path rather than intentionally making a second copy
+
+```text
+route
+```
+
+This helps explain why command placement matters.
+
+---
+
+# 56. The "early reduction" design rule
+
+When designing a high-volume pipeline, ask:
+
+1. Can I discard something now?
+2. Can I avoid extracting a field I do not need?
+3. Can I avoid processing events that will later be discarded?
+4. Do I really need duplicate copies?
+5. Do I really need every raw event downstream?
+
+A strong general pattern is:
+
+```text
+PARTITION
+    ↓
+EARLY FILTER
+    ↓
+MINIMAL EXTRACTION
+    ↓
+DEDUP (only when justified)
+    ↓
+MASK
+    ↓
+TRANSFORM / ENRICH
+    ↓
+AGGREGATE (only when raw detail is not required)
+    ↓
+ROUTE / COPY
+    ↓
+DESTINATION
+```
+
+This is a design guide, not a strict command order.
+
+Security and correctness requirements can require an earlier transformation.
+
+---
+
+# 57. Why masking can belong before `branch` or `thru`
+
+Suppose the original event contains:
+
+```text
+password=Secret123
+```
+
+If you branch first:
+
+```spl
+| branch
+    [
+        | eval _raw=replace(...)
+        | into $destination1
+    ],
+    [
+        | into $destination2
+    ];
+```
+
+the second path receives the unmasked copy.
+
+That is not what you want when both destinations must receive sanitized data.
+
+Prefer:
+
+```spl
+| eval _raw=replace(...)
+| branch
+    [
+        | into $destination1
+    ],
+    [
+        | into $destination2
+    ];
+```
+
+Now both paths receive the masked event.
+
+---
+
+# 58. Why `dedup` and `stats` should not be used automatically
+
+Both can reduce downstream volume, but they can also remove information.
+
+Use:
+
+```spl
+| dedup request_id
+```
+
+only when duplicate identity is clearly defined.
+
+Use:
+
+```spl
+| stats count() BY host
+```
+
+only when a summary is sufficient.
+
+Do not optimize by destroying data that the SOC or downstream application needs.
+
+---
+
+# 59. Destination design
+
+A destination is the place where processed data is sent.
+
+Do not automatically create one destination per index.
+
+For example, if multiple streams are going to the same Splunk platform deployment, the design may be:
+
+```text
+                one Splunk destination
+                     |
+         +-----------+-----------+
+         |           |           |
+      linux        dns       firewall
+       index       index        index
+```
+
+You may instead need multiple destinations when the data truly goes to different external endpoints.
+
+For example:
+
+```text
+Splunk deployment A
+Splunk deployment B
+Amazon S3
+```
+
+These are genuine destination differences.
+
+---
+
+# 60. `index` is not the same as `destination`
+
+This is very important.
+
+```text
+destination
+    = where the pipeline sends data
+
+index
+    = where the data is stored within a Splunk platform destination
+```
+
+Therefore:
+
+```spl
+| eval index="linux"
+```
+
+does not mean:
+
+```text
+"send the event to the Linux server"
+```
+
+It means:
+
+```text
+"set the event's index value to linux"
+```
+
+The actual destination is still controlled by:
+
+```spl
+| into $destination
+```
+
+or another destination variable.
+
+---
+
+# 61. Current index-routing caution
+
+For Splunk platform destinations, the final index can depend on the destination protocol and the index precedence [the order of rules used to decide the final index].
+
+Therefore, always check the current destination-specific documentation before assuming:
+
+```spl
+| eval index="linux"
+```
+
+is the only index-setting mechanism.
+
+---
+
+# 62. Default destination and accidental data loss
+
+Splunk recommends configuring a default destination to prevent unintended data loss.
+
+This matters because there are two different ideas:
+
+```text
+Intentional filtering
+    |
+    v
+where
+```
+
+versus:
+
+```text
+Data not processed by an applicable pipeline / no default destination
+    |
+    v
+may be dropped
+```
+
+These should never be confused.
+
+Current Splunk documentation explicitly warns to configure a default destination to avoid unintended data loss. [Official documentation](https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/filter-and-mask-data-using-an-edge-processor)
+
+---
+
+# 63. A complete architecture for your lab
+
+Use this as your default design pattern:
+
+```text
+                        INPUT
+                          |
+                          v
+                    PIPELINE PARTITION
+                          |
+                          v
+                    SELECTED INPUT
+                          |
+                          v
+                 EARLY WHERE FILTERS
+                    /           \
+              unwanted        wanted
+                 |               |
+                DROP             v
+                            MINIMAL EXTRACTION
+                                  |
+                                  v
+                              DEDUP?
+                                  |
+                                  v
+                             GLOBAL MASK
+                                  |
+                                  v
+                          TRANSFORM / ENRICH
+                                  |
+                                  v
+                              ROUTING
+                       /         |          \
+                      /          |           \
+                   Linux        DNS       Firewall
+                     |            |           |
+                     v            v           v
+                   dest1        dest2       dest3
+                      \            |          /
+                       \           |         /
+                            remaining
+                                |
+                                v
+                         default destination
+```
+
+If you also need an archive:
+
+```text
+                             MASKED DATA
+                                  |
+                               branch
+                              /      \
+                             /        \
+                         MAIN        ARCHIVE
+                          |
+                        route
+                   /       |       \
+                 Linux     DNS   Firewall
+                   |        |       |
+                   v        v       v
+                 dest1    dest2    dest3
+```
+
+---
+
+# 64. Recommended learning order
+
+Learn the pipeline behavior in this order:
+
+## Stage 1 — Pipeline basics
+
+```text
+$pipeline
+from $source
+into $destination
+partition
+destination
+```
+
+## Stage 2 — Basic event transformation
+
+```text
+eval
+replace()
+rex
+spath
+fields
+rename
+```
+
+## Stage 3 — Filtering and reduction
+
+```text
+where
+dedup
+stats
+```
+
+## Stage 4 — Data flow
+
+```text
+route
+thru
+branch
+```
+
+## Stage 5 — Conditional processing
+
+```text
+if
+```
+
+## Stage 6 — Enrichment and specialized processing
+
+```text
+lookup
+ocsf
+decrypt
+```
+
+## Stage 7 — Structured expansion
+
+```text
+expand
+flatten
+mvexpand
+```
+
+This order builds the concepts in the same order that the data moves through a real pipeline.
+
+---
+
+# 65. The final decision framework
+
+When writing a new pipeline, ask the following questions in order.
+
+### Question 1
+
+**What data should this pipeline receive?**
+
+Configure:
+
+```text
+Partition
+```
+
+### Question 2
+
+**Which events do I never want to process?**
+
+Use:
+
+```spl
+where
+```
+
+as early as reliable information allows.
+
+### Question 3
+
+**What information do I need to make later decisions?**
+
+Use:
+
+```text
+rex
+spath
+```
+
+and extract only what you need.
+
+### Question 4
+
+**Are there real duplicate events?**
+
+Use:
+
+```text
+dedup
+```
+
+with a meaningful duplicate key.
+
+### Question 5
+
+**Do I need every original event, or only a summary?**
+
+If summary is enough:
+
+```text
+stats
+```
+
+Otherwise retain the original events.
+
+### Question 6
+
+**Does the event need to be changed?**
+
+Use:
+
+```text
+eval
+replace
+rename
+fields
+if
+```
+
+### Question 7
+
+**Does the event need outside information?**
+
+Use:
+
+```text
+lookup
+```
+
+### Question 8
+
+**Does one subset need a different destination?**
+
+Use:
+
+```text
+route
+```
+
+### Question 9
+
+**Do I need an additional copy?**
+
+Use:
+
+```text
+thru
+```
+
+### Question 10
+
+**Do I need several complete independent copies?**
+
+Use:
+
+```text
+branch
+```
+
+### Question 11
+
+**Where should the remaining events go?**
+
+Use:
+
+```spl
+| into $destination;
+```
+
+as the main/default path where appropriate.
+
+---
+
+# 66. Your exact pipeline, cleaned up
+
+```spl
+import route from /splunk/ingest/commands
+
+/*
+The Edge Processor pipeline receives the subset defined by
+the pipeline partition configured in the Edge Processor builder.
+*/
+
+$pipeline = | from $source
+
+    /* =========================================
        1. EARLY FILTERING
-       Drop data that should never be processed.
-       ========================================== */
+       Remove events that should not be processed.
+       ========================================= */
 
     | where NOT match(_raw, /"action"\s*:\s*"debug"/i)
     | where NOT match(_raw, /"profile"\s*:\s*"test"/i)
 
 
-    /* ==========================================
-       2. MINIMAL FIELD EXTRACTION
-       Extract fields needed for routing/logic.
-       ========================================== */
+    /* =========================================
+       2. FIELD EXTRACTION
+       Extract only fields needed later.
+       ========================================= */
 
     | rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
     | rex field=_raw /"action"\s*:\s*"(?P<action>[^"]+)"/
 
 
-    /* ==========================================
+    /* =========================================
        3. OPTIONAL DEDUP
-       Use only a real duplicate identifier.
-       ========================================== */
+       Enable only when a real duplicate key exists.
+       ========================================= */
 
     /* | dedup request_id */
 
 
-    /* ==========================================
+    /* =========================================
        4. GLOBAL MASKING
-       Sanitize before routing/copying.
-       ========================================== */
+       ========================================= */
 
     | eval _raw=replace(
         _raw,
@@ -1955,9 +2696,9 @@ $pipeline = | from $source
     )
 
 
-    /* ==========================================
+    /* =========================================
        5. ROUTE LINUX
-       ========================================== */
+       ========================================= */
 
     | route profile == "linux", [
         | eval index="linux"
@@ -1965,9 +2706,9 @@ $pipeline = | from $source
     ]
 
 
-    /* ==========================================
+    /* =========================================
        6. ROUTE DNS
-       ========================================== */
+       ========================================= */
 
     | route profile == "dns", [
         | eval index="dns"
@@ -1975,9 +2716,9 @@ $pipeline = | from $source
     ]
 
 
-    /* ==========================================
+    /* =========================================
        7. ROUTE FIREWALL
-       ========================================== */
+       ========================================= */
 
     | route profile == "firewall", [
         | eval index="firewall"
@@ -1985,1443 +2726,208 @@ $pipeline = | from $source
     ]
 
 
-    /* ==========================================
-       8. DEFAULT REMAINING DATA
-       ========================================== */
+    /* =========================================
+       8. DEFAULT MAIN PATH
+       Events not diverted by previous routes.
+       ========================================= */
 
     | into $destination;
 ```
 
 ---
 
-# 42. If your real requirement is "drop everything except Linux"
-
-Do NOT overcomplicate this with routing.
-
-Use:
-
-```spl
-$pipeline = | from $source
-    | rex field=_raw /"profile"\s*:\s*"(?P<profile>[^"]+)"/
-    | where profile == "linux"
-    | eval _raw=replace(
-        _raw,
-        /"password":"[^"]*"/,
-        "\"password\":\"xxxxxxxx\""
-    )
-    | into $destination;
-```
-
-The data flow is:
-
-```text
-ALL EVENTS
-    |
-    v
-extract profile
-    |
-    v
-where profile == linux
-    |
- +--+--+
- |     |
-linux other
- |      |
- v      v
-mask   DROP
- |
- v
-destination
-```
-
-This is clearer than:
-
-```spl
-route linux -> destination
-then somehow drop everything else
-```
-
-When you simply want:
-
-> keep one subset and discard everything else,
-
-`where` is normally the clearest statement.
-
----
-
-# 43. If you want Linux somewhere and DROP everything else
-
-Use:
-
-```spl
-| where profile == "linux"
-| into $linux_destination;
-```
-
-No route is necessary.
-
-Because:
-
-```text
-Linux -> destination
-Other -> DROP
-```
-
----
-
-# 44. If you want Linux somewhere and all other data somewhere else
-
-Use:
-
-```spl
-| route profile == "linux", [
-    | into $linux_destination
-]
-| into $other_destination;
-```
-
-Because:
-
-```text
-Linux -> linux_destination
-Other -> other_destination
-```
-
----
-
-# 45. If you want Linux copied to another destination AND continue
-
-Use:
-
-```spl
-| route profile == "linux", [
-    | thru [
-        | into $extra_destination
-    ]
-    | into $linux_destination
-]
-| into $other_destination;
-```
-
-The exact nested structure can be adjusted to the required destinations, but the key concept is:
-
-```text
-route = select subset
-thru  = copy that subset while its path continues
-```
-
----
-
-# 46. If you want every event copied
-
-Use `branch` or a `thru` depending on the desired structure.
-
-Simple two-copy case:
-
-```spl
-| thru [
-    | into $archive
-]
-| into $main;
-```
-
-More independent multi-path case:
-
-```spl
-| branch
-    [
-        | into $destination1
-    ],
-    [
-        | into $destination2
-    ];
-```
-
-The documentation's routing examples show that these commands can also be nested and combined.
-
----
-
-# 47. When `branch` is NOT appropriate
-
-Do not use:
-
-```spl
-| branch
-    [
-        | route ...
-    ],
-    [
-        | route ...
-    ];
-```
-
-just because there are multiple classifications.
-
-If your requirement is simply:
-
-```text
-Linux -> A
-DNS -> B
-Firewall -> C
-Other -> D
-```
-
-then sequential `route` commands are easier to understand:
-
-```spl
-| route profile == "linux", [...]
-| route profile == "dns", [...]
-| route profile == "firewall", [...]
-| into $default;
-```
-
-Use `branch` when you actually want multiple copies of the input.
-
----
-
-# 48. A critical anti-pattern: branch before masking
-
-Bad design:
-
-```spl
-| branch
-    [
-        | eval ...mask...
-        | into $destination1
-    ],
-    [
-        | into $destination2
-    ];
-```
-
-Why is it dangerous?
-
-Because:
-
-```text
-destination2
-```
-
-gets the unmasked copy.
-
-Better:
-
-```spl
-| eval ...mask...
-| branch
-    [
-        | into $destination1
-    ],
-    [
-        | into $destination2
-    ];
-```
-
-Now both branches receive sanitized data.
-
----
-
-# 49. A critical anti-pattern: expensive parsing before obvious dropping
-
-Less efficient:
-
-```spl
-| rex big_complex_regex...
-| rex another_big_regex...
-| spath...
-| eval...
-| eval...
-| where action != "debug"
-```
-
-Better when `debug` can be recognized directly:
-
-```spl
-| where NOT match(_raw, /"action"\s*:\s*"debug"/i)
-| rex ...
-| spath ...
-| eval...
-```
-
-The principle is:
-
-```text
-cheap, high-volume reduction
-        before
-expensive processing
-```
-
-But do not sacrifice correctness simply to move a command earlier.
-
----
-
-# 50. A critical anti-pattern: dedup on `_raw` without a reason
-
-Avoid:
-
-```spl
-| dedup _raw
-```
-
-for large streams.
-
-The current SPL2 dedup documentation warns that `_raw` requires retaining the event text and can affect performance.
-
-Prefer:
-
-```spl
-| dedup event_id
-```
-
-or another meaningful identifier when the event format provides one.
-
----
-
-# 51. A critical anti-pattern: `dedup host`
-
-Be very careful with:
-
-```spl
-| dedup host
-```
-
-because it literally means:
-
-> Keep one event for a host.
-
-If a server generates:
-
-```text
-login
-logout
-process_start
-network_connection
-file_creation
-```
-
-you could throw away almost all of the useful information.
-
-Deduplication must match the real definition of a duplicate.
-
----
-
-# 52. A critical anti-pattern: using `stats` just to reduce volume
-
-This:
-
-```spl
-| stats count() BY host
-```
-
-is not "compressing the events."
-
-It is changing:
-
-```text
-many original events
-```
-
-into:
-
-```text
-summary events
-```
-
-If the SOC later needs the original authentication event, process creation event, or network connection event, that evidence has been removed from the downstream stream.
-
-Use `stats` when the downstream use case genuinely needs an aggregate.
-
----
-
-# 53. A critical anti-pattern: using many destinations when one destination is sufficient
-
-Suppose:
-
-```text
-Linux -> index=linux
-DNS   -> index=dns
-FW    -> index=firewall
-```
-
-and all three indexes belong to the same Splunk platform deployment.
-
-You may be able to use:
-
-```text
-one Splunk destination
-+
-different index metadata
-```
-
-rather than:
-
-```text
-three separate destinations
-```
-
-The correct choice depends on your destination/protocol and index-routing requirements.
-
-The destination is about **where the data goes**.
-
-The index is about **where it is stored within the Splunk deployment**.
-
----
-
-# 54. Global masking + route: recommended pattern for your lab
-
-Your requirement is:
-
-> "First remove unwanted events, then mask everything that remains, then route by profile."
-
-A clean design is:
-
-```text
-                     SOURCE
-                       |
-                       v
-                   PARTITION
-                       |
-                       v
-                 EARLY WHERE
-                       |
-                       | DROP unwanted
-                       v
-                MINIMAL EXTRACT
-                       |
-                       v
-                    DEDUP
-                 (if required)
-                       |
-                       v
-                 GLOBAL MASK
-                       |
-                       v
-                    ROUTE
-                /      |      \
-               /       |       \
-           Linux       DNS     Firewall
-             |           |        |
-             v           v        v
-           dest1       dest2    dest3
-               \        |       /
-                \       |      /
-                 remaining
-                     |
-                     v
-                  default
-```
-
-This is the pattern I recommend learning first.
-
----
-
-# 55. But what if you want an archive too?
-
-Then:
-
-```text
-                       SOURCE
-                         |
-                         v
-                      FILTER
-                         |
-                         v
-                       MASK
-                         |
-                         v
-                       BRANCH
-                    /         \
-                   /           \
-                  v             v
-             MAIN COPY      ARCHIVE COPY
-                 |
-                ROUTE
-              /   |    \
-           Linux DNS Firewall
-             |    |      |
-             v    v      v
-           dest1 dest2  dest3
-```
-
-This is where `branch` earns its place.
-
----
-
-# 56. What if the archive is only an additional copy of the final stream?
-
-Use `thru` instead:
-
-```text
-filter
-  |
-mask
-  |
-route
-  |
-thru ---> archive
-  |
-default destination
-```
-
-But remember that `thru` only copies the events that actually reach that point.
-
----
-
-# 57. What if I want to calculate metrics and not send raw data?
-
-Use `stats`.
-
-Example:
-
-```spl
-$pipeline = | from $source
-    | stats count() BY profile
-    | into $destination;
-```
-
-Input:
-
-```text
-linux
-linux
-linux
-dns
-dns
-firewall
-```
-
-Output:
-
-```text
-linux     3
-dns       2
-firewall  1
-```
-
-This is suitable only when the downstream destination needs the summary rather than the original event stream.
-
----
-
-# 58. Current Edge Processor command map
-
-The current Edge Processor pipeline documentation lists these processing commands:
-
-```text
-branch
-decrypt
-dedup
-eval
-expand
-fields
-flatten
-from
-if
-into
-lookup
-mvexpand
-ocsf
-rename
-replace
-rex
-route
-spath
-stats
-thru
-where
-```
-
-The current documentation also specifies that Edge Processor pipelines support a subset of SPL2 and that regular expressions use PCRE2.
-
-Do not assume that every SPL2 search command is therefore valid in an Edge Processor pipeline.
-
----
-
-# 59. Command map by job
-
-## Input / output
-
-```text
-from
-into
-```
-
-## Parse / extract
-
-```text
-rex
-spath
-```
-
-## Modify
-
-```text
-eval
-replace
-rename
-fields
-if
-ocsf
-decrypt
-```
-
-## Enrich
-
-```text
-lookup
-```
-
-## Filter / reduce
-
-```text
-where
-dedup
-stats
-```
-
-## Copy / routing
-
-```text
-route
-thru
-branch
-```
-
-## Structured-data expansion
-
-```text
-expand
-flatten
-mvexpand
-```
-
----
-
-# 60. Event-count behavior
-
-Another extremely useful way to classify commands is by what they can do to event count.
-
-## Can remove events
-
-```text
-where
-dedup
-stats
-```
-
-## Can create additional copies/results
-
-```text
-branch
-thru
-expand
-mvexpand
-```
-
-These do not all increase event count in the same way:
-
-- `branch` creates multiple copies of the incoming stream.
-- `thru` creates an additional copy while the original continues.
-- `expand` and `mvexpand` expand structured or multivalue data into multiple results.
-
-## Normally transform the existing event
-
-```text
-eval
-replace
-rename
-fields
-rex
-spath
-if
-decrypt
-ocsf
-```
-
-## Redirect subset
-
-```text
-route
-```
-
-`route` primarily changes the path taken by matching events rather than automatically making a second copy.
-
----
-
-# 61. Performance design: how to think about "best"
-
-There is no universal command order that is always fastest.
-
-Instead, evaluate every step using four questions:
-
-### Question 1 — Can I eliminate the event without parsing everything?
-
-Example:
-
-```text
-debug event
-```
-
-If yes:
-
-```spl
-| where NOT match(_raw, /debug/i)
-```
-
-can be early.
-
-### Question 2 — Do I need this field later?
-
-If not, do not extract it.
-
-### Question 3 — Can I reduce event count safely?
-
-Use:
-
-```text
-dedup
-stats
-```
-
-only when their semantics match the business requirement.
-
-### Question 4 — Am I creating copies unnecessarily?
-
-Every:
-
-```text
-thru
-branch
-```
-
-can increase the downstream amount of data.
-
-Use them because a second path is required, not simply because multiple destinations exist.
-
----
-
-# 62. The "cheapest useful operation first" rule
-
-A good design principle is:
-
-```text
-CHEAP FILTER
-    |
-    v
-MINIMAL PARSE
-    |
-    v
-REDUCE
-    |
-    v
-EXPENSIVE TRANSFORM
-    |
-    v
-ENRICH
-    |
-    v
-ROUTE / COPY
-```
-
-But security requirements can change the order.
-
-For example:
-
-```text
-If a copy will leave the trusted boundary:
-    mask before creating that copy.
-```
-
-Therefore the actual goal is:
-
-> **Do the earliest safe operation that removes the most unnecessary work.**
-
----
-
-# 63. "Drop first" versus "mask first"
-
-These are not always competing requirements.
-
-Suppose 20% of your events should be dropped and 80% need masking.
-
-A sensible structure is:
-
-```text
-EARLY DROP
-    |
-    v
-80% remaining
-    |
-    v
-MASK
-```
-
-instead of:
-
-```text
-100%
- |
-MASK
- |
-DROP 20%
-```
-
-because you otherwise spend masking work on data that will never be sent.
-
-However, if the filter requires a field that only exists after parsing, you must perform enough extraction to make the decision.
-
----
-
-# 64. "Extract first" versus "filter raw"
-
-Use this decision:
-
-```text
-Can the unwanted event be identified reliably from _raw?
-       |
-      YES
-       |
-       v
-cheap raw filtering can happen first
-
-      NO
-       |
-       v
-extract the minimum field required
-       |
-       v
-where
-```
-
-Example:
-
-```text
-_raw contains:
-"profile":"test"
-```
-
-A simple raw match can be enough:
-
-```spl
-| where NOT match(_raw, /"profile"\s*:\s*"test"/i)
-```
-
-But if the rule depends on:
-
-```text
-nested JSON
-computed value
-lookup result
-```
-
-then extraction/enrichment may be necessary before the filter.
-
----
-
-# 65. Best practice for routing fields
-
-Do not extract ten fields when you only need one for routing.
-
-If routing requires:
-
-```text
-profile
-```
-
-extract:
-
-```spl
-| rex field=_raw /"profile":"(?P<profile>[^"]+)"/
-```
-
-Do not immediately parse:
-
-```text
-profile
-action
-username
-department
-browser
-country
-application
-device
-version
-...
-```
-
-unless those fields are actually required.
-
----
-
-# 66. Best practice for temporary fields
-
-Temporary routing fields can be removed after the decision.
-
-For example:
-
-```spl
-| rex field=_raw /"profile":"(?P<profile>[^"]+)"/
-| route profile == "linux", [
-    | fields - profile
-    | into $linux_destination
-]
-```
-
-Whether you should remove it depends on whether the destination needs the field.
-
-Do not remove useful context merely for cleanliness.
-
----
-
-# 67. Best practice for `where`
-
-Use `where` when the question is:
-
-> "Should this event remain in the pipeline?"
-
-Examples:
-
-```spl
-| where status == 200
-```
-
-```spl
-| where profile IN ("linux", "dns")
-```
-
-```spl
-| where NOT match(_raw, /healthcheck/i)
-```
-
-Avoid using `route` merely to simulate a drop.
-
----
-
-# 68. Best practice for `route`
-
-Use `route` when the question is:
-
-> "This event belongs somewhere different."
-
-Example:
-
-```spl
-| route profile == "linux", [
-    | eval index="linux"
-    | into $destination
-]
-| into $destination;
-```
-
-Use multiple `route`s when classification is sequential:
-
-```text
-Linux
-DNS
-Firewall
-Everything else
-```
-
----
-
-# 69. Best practice for `thru`
-
-Use `thru` when:
-
-```text
-"I need an additional copy, and the original should keep going."
-```
-
-Example:
-
-```spl
-| thru [
-    | into $archive
-]
-| into $main;
-```
-
-A classic use is:
-
-```text
-sanitized stream
-   |
-   +---- archive
-   |
-   +---- main Splunk stream
-```
-
----
-
-# 70. Best practice for `branch`
-
-Use `branch` when:
-
-```text
-"I need multiple complete copies that can be processed independently."
-```
-
-Example:
-
-```spl
-| branch
-    [
-        | ...process A...
-        | into $destinationA
-    ],
-    [
-        | ...process B...
-        | into $destinationB
-    ];
-```
-
-The more branches you add, the more downstream data can be generated.
-
-Therefore use it deliberately.
-
----
-
-# 71. Best practice for `dedup`
-
-Ask:
-
-```text
-"What field combination defines a duplicate?"
-```
-
-Only then write:
-
-```spl
-| dedup event_id
-```
-
-or:
-
-```spl
-| dedup host, request_id
-```
-
-Do not start with `_raw` simply because it is available.
-
-Also remember that in current SPL2, dedup keeps the first event encountered for a duplicate combination unless you specify a different count.
-
----
-
-# 72. Best practice for `stats`
-
-Ask:
-
-```text
-"Does the downstream system need every original event?"
-```
-
-If YES:
-
-```text
-do not aggregate the raw event stream away
-```
-
-If NO:
-
-```text
-stats can reduce the output volume
-```
-
-For example:
-
-```spl
-| stats count() BY host
-```
-
-can replace thousands of individual events with a much smaller set of summary records.
-
-For Edge Processor, remember that `stats` is a streaming aggregation with a state window, not the same operational model as search-time statistics.
-
----
-
-# 73. Best practice for destinations
-
-A useful hierarchy is:
-
-```text
-Different endpoint/system?
-    -> different destination
-
-Same Splunk deployment, different index?
-    -> often one destination + index routing
-
-Need archive copy?
-    -> thru or branch + archive destination
-
-Need only a filtered subset?
-    -> where before into
-
-Need classification only?
-    -> if/eval may be enough
-```
-
-Always verify the actual index precedence for your destination protocol.
-
----
-
-# 74. Default destination: important safety setting
-
-Splunk recommends configuring a default destination to avoid unintended data loss for unprocessed data.
-
-Without a default destination, unprocessed data can be dropped.
-
-This is different from intentionally filtering data with `where`.
-
-Therefore distinguish:
-
-```text
-INTENTIONAL DROP
-    where ...
-
-UNPROCESSED DATA
-    partition mismatch / no applicable pipeline
-```
-
-Those are not the same event-flow condition.
-
----
-
-# 75. Your complete architecture for a production-style security stream
-
-A robust design can look like:
-
-```text
-                SOURCE
-                  |
-                  v
-             EDGE PROCESSOR
-                  |
-                  v
-            PARTITION SCOPE
-                  |
-                  v
-          EARLY FILTER / DROP
-                  |
-          unwanted --> DROP
-                  |
-                  v
-        MINIMAL EXTRACTION
-                  |
-                  v
-              DEDUP?
-                  |
-                  v
-         GLOBAL SANITIZATION
-         password / card / PII
-                  |
-                  v
-            ENRICHMENT?
-             lookup / OCSF
-                  |
-                  v
-            AGGREGATION?
-                stats
-                  |
-                  v
-              ROUTING
-           /      |      \
-          /       |       \
-      Linux      DNS    Firewall
-        |          |        |
-        v          v        v
-      dest1      dest2    dest3
-          \        |       /
-           \       |      /
-            remaining
-                |
-                v
-          default destination
-```
-
-This gives you a disciplined way to decide where every command belongs.
-
----
-
-# 76. A complete decision table
-
-| Requirement | Command | Result |
-|---|---|---|
-| Read incoming data | `from` | Starts pipeline input |
-| Send data | `into` | Terminates a path and sends data |
-| Drop unwanted events | `where` | Matching false events leave the pipeline |
-| Remove duplicate combinations | `dedup` | Duplicate events are removed |
-| Summarize many events | `stats` | Emits aggregate results |
-| Extract from raw | `rex` | Creates fields |
-| Parse JSON/XML | `spath` | Extracts structured values |
-| Change field/value | `eval` | Adds/modifies fields |
-| Mask text | `eval` + `replace()` | Changes content |
-| Remove fields | `fields` | Event remains, selected fields removed |
-| Rename fields | `rename` | Changes field names |
-| Conditional processing | `if` | First matching branch processes event |
-| Add lookup information | `lookup` | Enriches events |
-| Normalize to OCSF | `ocsf` | Converts supported data to OCSF |
-| Decrypt field | `decrypt` | Decrypts supported encrypted data |
-| Expand object arrays | `expand` | Expands structured arrays |
-| Flatten object | `flatten` | Promotes first-level keys to fields |
-| Expand multivalue field | `mvexpand` | Produces separate results |
-| Send a subset elsewhere | `route` | Diverts matching subset |
-| Make a copy and continue | `thru` | Copy + original continues |
-| Make multiple complete paths | `branch` | Every branch receives a copy |
-
----
-
-# 77. A simple rulebook to memorize
-
-```text
-DROP?
-    where
-
-DUPLICATE?
-    dedup
-
-SUMMARY?
-    stats
-
-CHANGE?
-    eval / replace / rename / fields
-
-EXTRACT?
-    rex / spath
-
-DIFFERENT DESTINATION?
-    route
-
-EXTRA COPY?
-    thru
-
-MULTIPLE COMPLETE PATHS?
-    branch
-
-CONDITIONAL TRANSFORMATION?
-    if
-
-ENRICH?
-    lookup
-
-NORMALIZE?
-    ocsf
-
-DECRYPT?
-    decrypt
-
-EXPAND STRUCTURED DATA?
-    expand / flatten / mvexpand
-```
-
----
-
-# 78. Your eBPF analogy, finalized
-
-The most useful comparison is:
-
-```text
-eBPF / kernel world
-
-packet
-  |
-  v
-early filter
-  |
-  +--> DROP
-  |
-  v
-expensive processing
-```
-
-Versus:
-
-```text
-Edge Processor
-
-event arrives
-  |
-  v
-partition scope
-  |
-  v
-where
-  |
-  +--> DROP
-  |
-  v
-parse
-  |
-  v
-dedup / transform / enrich
-  |
-  v
-route
-  |
-  v
-destination
-```
-
-The architectural goal is similar:
-
-> **Do not spend expensive downstream work on data that you already know you do not need.**
-
-But the layer is different.
-
-eBPF can affect packet processing before the event reaches the logging pipeline.
-
-Edge Processor filters event data after it has arrived at the Edge Processor.
-
----
-
-# 79. Final recommended design for your current lab
-
-Given your exact use case:
-
-> "Receive raw logs → remove unwanted traffic → extract profile/action → globally mask sensitive data → route Linux/DNS/Firewall → send the remainder normally."
-
-Use:
+# 67. The complete mental model
 
 ```text
 PARTITION
-    ↓
-EARLY WHERE
-    ↓
+    |
+    |  "What input belongs to this pipeline?"
+    v
+FROM $SOURCE
+    |
+    v
+WHERE
+    |
+    |  "Should this event continue?"
+    |
+    +------ NO ------> DROP / not sent to this pipeline destination
+    |
+    v
 REX / SPATH
-    ↓
-OPTIONAL DEDUP
-    ↓
-GLOBAL MASKING
-    ↓
-ROUTE LINUX
-    ↓
-ROUTE DNS
-    ↓
-ROUTE FIREWALL
-    ↓
-DEFAULT DESTINATION
+    |
+    |  "What fields do I need?"
+    v
+DEDUP
+    |
+    |  "Is this event a duplicate?"
+    v
+MASK / TRANSFORM
+    |
+    |  "How should I change it?"
+    v
+LOOKUP / OCSF / DECRYPT
+    |
+    |  "Do I need enrichment or special processing?"
+    v
+STATS
+    |
+    |  "Do I need a summary instead of every raw event?"
+    v
+ROUTE
+    |
+    |  "Where should subsets go?"
+    |
+    +---- Linux ------> destination2
+    |
+    +---- DNS --------> destination3
+    |
+    +---- Firewall ---> destination4
+    |
+    +---- Remaining --> main path
+                          |
+                          v
+                        INTO
 ```
 
-And if you need an archive:
+---
+
+# 68. The five concepts that explain most Edge Processor pipelines
+
+If you understand these five, most pipeline designs become straightforward:
+
+```text
+1. PARTITION
+   Defines the pipeline's input scope.
+
+2. WHERE
+   Removes events that should not continue.
+
+3. TRANSFORM
+   Changes or extracts event information.
+
+4. ROUTE
+   Diverts a subset to another path.
+
+5. INTO
+   Sends each completed path to a destination.
+```
+
+Then add:
+
+```text
+dedup
+    when duplicates must be removed
+
+stats
+    when many events should become summaries
+
+thru
+    when an extra copy is needed
+
+branch
+    when several complete copies are needed
+
+if
+    when different processing is needed without necessarily changing destination
+```
+
+---
+
+# 69. Official Splunk documentation
+
+Use these as the primary references for this chapter:
+
+- Edge Processor pipeline syntax  
+  https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/working-with-pipelines/edge-processor-pipeline-syntax
+
+- Filter and mask data using an Edge Processor  
+  https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/filter-and-mask-data-using-an-edge-processor
+
+- Process a subset of data using an Edge Processor (`route`)  
+  https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/route-data-using-pipelines/process-a-subset-of-data-using-an-edge-processor
+
+- Routing data in the same Edge Processor pipeline  
+  https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/route-data-using-pipelines/routing-data-in-the-same-edge-processor-pipeline-to-different-actions-and-destinations
+
+- Process a copy of data using an Edge Processor (`thru`)  
+  https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/route-data-using-pipelines/process-a-copy-of-data-using-an-edge-processor
+
+- Process multiple copies of data using an Edge Processor (`branch`)  
+  https://help.splunk.com/en/splunk-enterprise/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.2/route-data-using-pipelines/process-multiple-copies-of-data-using-an-edge-processor
+
+- SPL2 `where` command  
+  https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/where-command/where-command-overview-syntax-and-usage
+
+- SPL2 `dedup` command  
+  https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/dedup-command/dedup-command-overview-syntax-and-usage
+
+- SPL2 `if` command  
+  https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/if-command/if-command-overview-syntax-and-usage
+
+- Aggregate event data using Edge Processor  
+  https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/aggregate-event-data-using-edge-processor
+
+- Troubleshoot Edge Processor partition/filter behavior  
+  https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/troubleshooting/troubleshoot-the-edge-processor-solution
+
+---
+
+# 70. Final rules to remember
+
+```text
+PARTITION
+    configured in the builder
+    -> defines what the pipeline processes
+
+WHERE
+    -> removes events from the continuing pipeline
+
+REX / SPATH
+    -> obtain fields needed for decisions
+
+DEDUP
+    -> removes duplicate events based on specified fields
+
+STATS
+    -> turns many events into aggregate results
+
+EVAL / REPLACE
+    -> changes event data
+
+ROUTE
+    -> diverts a subset to another path
+
+THRU
+    -> makes an additional copy while the original continues
+
+BRANCH
+    -> makes multiple complete paths
+
+IF
+    -> performs conditional processing
+
+INTO
+    -> sends the path to its configured destination
+```
+
+The strongest default design for a high-volume transformation pipeline is:
 
 ```text
 PARTITION
     ↓
 EARLY WHERE
     ↓
-EXTRACT
+MINIMAL EXTRACTION
     ↓
-MASK
+DEDUP (only if justified)
     ↓
-BRANCH
-   ├── main routing
-   │      ├── Linux
-   │      ├── DNS
-   │      ├── Firewall
-   │      └── default
-   │
-   └── archive
+MASK / TRANSFORM
+    ↓
+ENRICH / NORMALIZE if required
+    ↓
+ROUTE / COPY
+    ↓
+INTO
 ```
 
-If you only need an additional copy of the current stream:
-
-```text
-...processing...
-      |
-     thru
-    /    \
- archive  continue
-            |
-            v
-         destination
-```
-
----
-
-# 80. Official documentation used
-
-1. **Edge Processor pipeline syntax**  
-   https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/working-with-pipelines/edge-processor-pipeline-syntax
-
-2. **Filter and mask data using an Edge Processor**  
-   https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/filter-and-mask-data-using-an-edge-processor
-
-3. **How data moves through the Edge Processor solution**  
-   https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/how-the-edge-processor-solution-works/how-data-moves-through-the-edge-processor-solution
-
-4. **Process a subset of data using an Edge Processor (`route`)**  
-   https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/route-data-using-pipelines/process-a-subset-of-data-using-an-edge-processor
-
-5. **Routing data in the same Edge Processor pipeline**  
-   https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/route-data-using-pipelines/routing-data-in-the-same-edge-processor-pipeline-to-different-actions-and-destinations
-
-6. **SPL2 `dedup` command**  
-   https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/dedup-command/dedup-command-overview-syntax-and-usage
-
-7. **SPL2 `where` command**  
-   https://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/where-command/where-command-overview-syntax-and-usage
-
-8. **SPL2 `stats` examples**  
-   https://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/stats-command/stats-command-examples
-
-9. **Aggregate event data using Edge Processor**  
-   https://help.splunk.com/en/data-management/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/process-data-using-pipelines/aggregate-event-data-using-edge-processor
-
-10. **Send data from Edge Processors to Splunk Cloud Platform**  
-    https://help.splunk.com/en/splunk-cloud-platform/process-data-at-the-edge/use-edge-processors-for-splunk-cloud-platform/send-data-out-from-edge-processors/send-data-from-edge-processors-to-the-splunk-cloud-platform-deployment-connected-to-your-tenant
-
----
-
-## The one-page mental model
-
-```text
-                  ┌──────────────────────────┐
-                  │         SOURCE           │
-                  └────────────┬─────────────┘
-                               |
-                               v
-                         PARTITION
-                    "scope of pipeline"
-                               |
-                               v
-                         WHERE / DROP
-                    "should event survive?"
-                               |
-                               v
-                       REX / SPATH
-                   "what fields do I need?"
-                               |
-                               v
-                         DEDUP?
-                   "is this a duplicate?"
-                               |
-                               v
-                     MASK / TRANSFORM
-                    "sanitize and modify"
-                               |
-                               v
-                        LOOKUP / OCSF
-                    "enrich / normalize"
-                               |
-                               v
-                          STATS?
-                     "do I need summaries?"
-                               |
-                               v
-                           ROUTE
-                    "where should subsets go?"
-                         /     |      \
-                        /      |       \
-                       v       v        v
-                    Linux     DNS    Firewall
-                       \       |       /
-                        \      |      /
-                         v     v     v
-                       DEFAULT / REMAINING
-                               |
-                               v
-                             INTO
-                               |
-                               v
-                         DESTINATION
-```
-
-**Design rule:** filter unwanted events as early as the available information allows, avoid unnecessary extraction and copying, sanitize before creating any less-trusted copy, use `route` for destination selection, `thru` for an extra copy that keeps the original path, `branch` for multiple complete copies, `dedup` only with a real duplicate definition, and `stats` only when the original event detail is not required downstream.
+The exact order should always follow the actual data and the required result. The goal is not to use every command; the goal is to use the smallest number of correct operations in the right places.
