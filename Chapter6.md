@@ -726,347 +726,1853 @@ That distinction prevents a large class of timestamp mistakes.
 
 ---
 
-# 6.18 Moving Baselines — The Splunk Way
+# 6.18 `streamstats` — The Core Idea
 
-The original CrowdStrike chapter introduced a `window()` function for calculating a moving baseline.
+`streamstats` is the main Splunk command for **running [calculated progressively as each event/result is processed] and moving [calculated over a limited recent set] statistics**.
 
-Splunk does **not** have a one-to-one `window()` function with that same syntax.
-
-The native Splunk tool for running and moving calculations is:
+The most important idea is:
 
 ```text
+stats
+    ↓
+Looks at the result set as a whole
+    ↓
+Produces aggregate results
+
 streamstats
+    ↓
+Processes results one by one
+    ↓
+Adds the calculation to each result
 ```
 
-Splunk documents `streamstats` as a command that adds cumulative or windowed statistical values to each result as the results are processed. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+Splunk describes `streamstats` as a centralized streaming command: it calculates statistics for each event at the time the event is seen. The calculation can also operate on the results produced by commands such as `stats`, `chart`, or `timechart`. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+A simple example:
+
+```spl
+index=windows
+| streamstats count AS event_number
+| table _time event_number
+```
+
+Conceptually:
+
+```text
+Event 1 → event_number = 1
+Event 2 → event_number = 2
+Event 3 → event_number = 3
+Event 4 → event_number = 4
+```
+
+Unlike `stats`, the original rows remain available.
 
 ---
 
-# 6.19 Building a Rolling Baseline
+# 6.19 `stats` vs `streamstats` vs `eventstats`
 
-Suppose we already have one count per 10-minute bucket:
+These commands are related, but they answer different questions.
+
+Suppose the events are:
 
 ```text
-_time     current
------------------
-10:00       10
-10:10       12
-10:20        9
-10:30       11
-10:40       13
-10:50       80
+_time   user   bytes
+------  -----  -----
+10:00   teja   100
+10:01   teja   200
+10:02   john   300
+10:03   teja   400
 ```
 
-We want the average of the previous six buckets as a baseline.
-
-Traditional SPL can use:
+### `stats`
 
 ```spl
-| streamstats window=6 current=f avg(current) AS baseline
+| stats sum(bytes) BY user
 ```
 
-The important part is:
+Result:
 
 ```text
-window=6
+user   sum(bytes)
+-----  ----------
+teja   700
+john   300
+```
+
+`stats` **collapses [reduces many events into aggregate rows]** the result set.
+
+Question:
+
+> What is the total bytes for each user?
+
+### `eventstats`
+
+```spl
+| eventstats sum(bytes) AS total_bytes BY user
+```
+
+Conceptually:
+
+```text
+_time   user   bytes   total_bytes
+------  -----  -----   -----------
+10:00   teja   100     700
+10:01   teja   200     700
+10:02   john   300     300
+10:03   teja   400     700
+```
+
+`eventstats` calculates the aggregate over the relevant result set and adds it back to the matching events.
+
+Question:
+
+> What is this user's total, while keeping every event?
+
+### `streamstats`
+
+```spl
+| sort 0 _time
+| streamstats sum(bytes) AS running_bytes BY user
+```
+
+Result:
+
+```text
+_time   user   bytes   running_bytes
+------  -----  -----   -------------
+10:00   teja   100     100
+10:01   teja   200     300
+10:02   john   300     300
+10:03   teja   400     700
+```
+
+Question:
+
+> What was the running total for this user at each event?
+
+The key distinction is:
+
+```text
+stats
+    → aggregate the whole result set
+
+eventstats
+    → aggregate the whole result set + attach result to events
+
+streamstats
+    → aggregate progressively as each result is processed
+```
+
+Splunk's current documentation makes the same distinction: `stats` works on the result set as a whole, `eventstats` adds aggregate statistics inline, and `streamstats` calculates at the time each event is seen. citehttps://help.splunk.com/en/splunk-enterprise/search/search-manual/10.2/calculate-statistics/use-the-stats-command-and-functions
+
+---
+
+# 6.20 `streamstats` Syntax
+
+Traditional SPL supports these options:
+
+```spl
+| streamstats
+    [reset_on_change=<bool>]
+    [reset_before="("<eval-expression>")"]
+    [reset_after="("<eval-expression>")"]
+    [current=<bool>]
+    [window=<int>]
+    [time_window=<span-length>]
+    [global=<bool>]
+    [allnum=<bool>]
+    <stats-aggregation>...
+    [BY <field-list>]
+```
+
+The options must appear before the aggregation terms. The `BY` clause is placed after the aggregation in classic SPL. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+SPL2 uses a different reset syntax:
+
+```spl2
+| streamstats
+    [current=<bool>]
+    [reset before <eval-expression>
+     after <eval-expression>
+     onchange]
+    [window=<int>]
+    <aggregation>...
+    [BY <field-list>]
+```
+
+In current SPL2, these classic-SPL options have no equivalent:
+
+```text
+allnum
+global
+time_window
+```
+
+SPL2 combines the reset controls into one `reset` clause and does not require the same escaping of quotation marks and parentheses that classic SPL requires. citehttps://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+
+---
+
+# 6.21 Option 1 — `current`
+
+`current` controls whether the **current result** is included in the calculation.
+
+Default:
+
+```spl
+current=true
+```
+
+For example:
+
+```spl
+| streamstats sum(bytes) AS total
+```
+
+is equivalent to:
+
+```spl
+| streamstats current=true sum(bytes) AS total
+```
+
+Suppose:
+
+```text
+event   bytes
+-----   -----
+1       100
+2       200
+3       300
+4       400
+```
+
+With `current=true`:
+
+```text
+event   bytes   total
+-----   -----   -----
+1       100     100
+2       200     300
+3       300     600
+4       400     1000
+```
+
+The current event contributes to its own result.
+
+### `current=false`
+
+```spl
+| streamstats current=false sum(bytes) AS previous_total
+```
+
+Now the current event is excluded:
+
+```text
+event   bytes   previous_total
+-----   -----   --------------
+1       100     null
+2       200     100
+3       300     300
+4       400     600
+```
+
+This is useful when you want to compare the current event with what existed **before** it.
+
+For example:
+
+```spl
+| streamstats current=false last(src_ip) AS previous_ip
+```
+
+can provide the previous `src_ip` in the stream.
+
+Official SPL documentation defines `current=true` as including the current event and `current=false` as using values from the previous event/result. The default is `true`. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.22 Option 2 — `window`
+
+`window` controls the maximum number of events/results used by the calculation.
+
+Example:
+
+```spl
+| streamstats window=3 sum(bytes) AS total_bytes
+```
+
+Suppose:
+
+```text
+event   bytes
+-----   -----
+1       100
+2       200
+3       300
+4       400
+5       500
+```
+
+With `current=true`:
+
+```text
+event  window contents     total_bytes
+-----  -----------------   -----------
+1      100                 100
+2      100,200             300
+3      100,200,300         600
+4      200,300,400         900
+5      300,400,500         1200
+```
+
+The important point is:
+
+```text
+window=3
+    ↓
+Current result + previous 2 results
+```
+
+It is a **row-count window [a window based on the number of results]**, not a time window.
+
+The `window` value must be non-negative. The documented default is `0`, meaning use the accumulated previous and current results, subject to Splunk's configured stream-window limits. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.23 `current` + `window` Together
+
+These two options become especially important together.
+
+Suppose:
+
+```text
+bytes = 10, 20, 30, 40, 50
+```
+
+### `window=3 current=true`
+
+```spl
+| streamstats window=3 current=true sum(bytes) AS total
+```
+
+Result:
+
+```text
+10 → 10
+20 → 30
+30 → 60
+40 → 90
+50 → 120
+```
+
+The calculation is:
+
+```text
+10
+10+20
+10+20+30
+20+30+40
+30+40+50
+```
+
+### `window=3 current=false`
+
+```spl
+| streamstats window=3 current=false sum(bytes) AS previous_total
+```
+
+Result:
+
+```text
+10 → null
+20 → 10
+30 → 30
+40 → 60
+50 → 90
+```
+
+Now the current event is excluded:
+
+```text
+Event 4:
+previous three = 10+20+30 = 60
+current 40 is excluded
+```
+
+This combination is extremely useful when constructing baselines [normal reference values] or comparing the current value with recent history.
+
+---
+
+# 6.24 Option 3 — `BY`
+
+`BY` creates independent aggregations for different field values.
+
+Example:
+
+```spl
+| streamstats count AS user_event_number BY user
+```
+
+Data:
+
+```text
+event   user
+-----   ----
+1       teja
+2       john
+3       teja
+4       john
+5       teja
+```
+
+Result:
+
+```text
+event   user   user_event_number
+-----   -----  -----------------
+1       teja   1
+2       john   1
+3       teja   2
+4       john   2
+5       teja   3
+```
+
+Without `BY`:
+
+```spl
+| streamstats count AS event_number
+```
+
+you get:
+
+```text
+1
+2
+3
+4
+5
+```
+
+With `BY user`, each user's running calculation is separate.
+
+Multiple fields are also possible:
+
+```spl
+| streamstats count BY user src_ip
+```
+
+That creates a separate stream for each `user + src_ip` combination.
+
+Splunk documents `BY` as the grouping clause for one or more fields. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.25 Option 4 — `global`
+
+`global` matters when you combine:
+
+```text
+BY + window
+```
+
+Classic SPL defaults to:
+
+```spl
+global=true
+```
+
+With `global=true`, a single event window is shared across the result stream.
+
+With:
+
+```spl
+global=false
+```
+
+and a non-zero `window`, each `BY` group has its own event window. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+Consider:
+
+```text
+event   host   bytes
+-----   ----   -----
+1       A      10
+2       B      20
+3       A      30
+4       B      40
+```
+
+### `global=true`
+
+```spl
+| streamstats window=2 global=true sum(bytes) AS total BY host
+```
+
+A single last-two-event window moves through the whole stream:
+
+```text
+event  window       host  total
+-----  -----------  ----  -----
+1      A:10         A     10
+2      A:10,B:20    B     20
+3      B:20,A:30    A     30
+4      A:30,B:40    B     40
+```
+
+Only the values belonging to the current `BY` group inside that shared window contribute to that group's aggregation.
+
+### `global=false`
+
+```spl
+| streamstats window=2 global=false sum(bytes) AS total BY host
+```
+
+Each host maintains its own two-event window:
+
+```text
+event  host  host window    total
+-----  ----  ------------   -----
+1      A     A:10           10
+2      B     B:20           20
+3      A     A:10,A:30      40
+4      B     B:20,B:40      60
+```
+
+This option is advanced. Learn it after `BY` and `window`.
+
+---
+
+# 6.26 Option 5 — `reset_on_change`
+
+Classic SPL:
+
+```spl
+| streamstats count BY shift reset_on_change=true
+```
+
+This resets the running calculation when a `BY` field changes between incoming results.
+
+Example:
+
+```text
+event   shift
+-----   -----
+1       DAY
+2       DAY
+3       NIGHT
+4       NIGHT
+5       NIGHT
+6       DAY
+7       NIGHT
+```
+
+Result:
+
+```text
+event  shift   count
+-----  ------  -----
+1      DAY       1
+2      DAY       2
+3      NIGHT     1
+4      NIGHT     2
+5      NIGHT     3
+6      DAY       1
+7      NIGHT     1
+```
+
+Notice that the count does not simply mean "the number of DAY events seen so far." Instead, it resets whenever the group-by value changes.
+
+This is especially useful when the input is already ordered into meaningful runs.
+
+Important:
+
+```text
+BY user
+reset_on_change=true
+```
+
+looks at whether the `user` value changes in the incoming sequence.
+
+It is therefore sensitive to **result order**. With multiple `BY` fields, the reset can be triggered when the group defined by those fields changes; official SPL also notes that an event must have all of the group-by fields to trigger the reset.
+
+---
+
+# 6.27 Option 6 — `reset_before`
+
+`reset_before` resets the accumulated statistics **for the event where the condition is true, before calculating that event**.
+
+Classic SPL syntax:
+
+```spl
+| streamstats reset_before="("<eval-expression>")" sum(bytes) AS total
+```
+
+Example:
+
+```spl
+| streamstats reset_before="(action=\"REBOOT\")" sum(bytes) AS total
+```
+
+Suppose:
+
+```text
+event   action          bytes
+-----   --------------  -----
+1       LOGON           100
+2       DOWNLOAD        400
+3       REBOOT           50
+4       LOGON           100
+```
+
+Result:
+
+```text
+event  action      bytes  total
+-----  ----------  -----  -----
+1      LOGON       100    100
+2      DOWNLOAD    400    500
+3      REBOOT       50     50
+4      LOGON        100    150
+```
+
+At `REBOOT`, the previous accumulated state is discarded first.
+
+That is the meaning of:
+
+```text
+reset BEFORE calculation for this event
+```
+
+Splunk documents that `reset_before` resets the aggregation on the event whose expression evaluates to true. If `window` is also used, the window is reset as well. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.28 Option 7 — `reset_after`
+
+`reset_after` waits until the current result has been calculated, then resets the aggregation for the next result.
+
+```spl
+| streamstats reset_after="(action=\"REBOOT\")" sum(bytes) AS total
+```
+
+Same input:
+
+```text
+event   action       bytes
+-----   -----------  -----
+1       LOGON        100
+2       DOWNLOAD     400
+3       REBOOT       50
+4       LOGON        100
+```
+
+Result:
+
+```text
+event  action      bytes  total
+-----  ----------  -----  -----
+1      LOGON       100    100
+2      DOWNLOAD    400    500
+3      REBOOT       50    550
+4      LOGON        100    100
+```
+
+The `REBOOT` event is included in the old calculation.
+
+Then the next event starts from a fresh state.
+
+So remember:
+
+```text
+reset_before
+    → reset first
+    → calculate current event
+
+reset_after
+    → calculate current event
+    → reset for next event
+```
+
+This distinction is one of the most important `streamstats` concepts. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.29 `reset_before` / `reset_after` With `match()`
+
+`reset_before` and `reset_after` need a Boolean expression [an expression that evaluates to true or false].
+
+That is where `match()` is useful.
+
+```spl
+match(_raw,"oracle")
+```
+
+returns a Boolean condition:
+
+```text
+TRUE
+or
+FALSE
+```
+
+So you can use:
+
+```spl
+| streamstats reset_before="(match(_raw,\"oracle\"))" window=3 sum(pid) AS sumpid
+```
+
+Classic SPL requires the reset expression to be enclosed in the reset argument, and quotation marks inside that expression must be escaped.
+
+For example:
+
+```spl
+reset_before="(match(_raw,\"oracle.*\"))"
+```
+
+The quotation marks around `oracle.*` are escaped because they are nested inside another quoted expression.
+
+Splunk's official examples demonstrate this exact escaping pattern for `match()` inside a `reset_before`/`reset_after` expression. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+A complete example:
+
+```spl
+index=* source="/var/log/secure"
+| sort 0 _time
+| streamstats reset_before="(match(_raw,\"oracle.*\"))" window=3 sum(pid) AS sumpid
+| table _time pid sumpid _raw
+```
+
+Conceptually:
+
+```text
+events before Oracle
+        ↓
+running 3-event sum
+        ↓
+Oracle event found
+        ↓
+RESET
+        ↓
+Oracle event starts new calculation
+```
+
+You can use a simple field condition when regex is unnecessary:
+
+```spl
+reset_before="(action=\"REBOOT\")"
+```
+
+Use `match()` when you need a regular-expression condition.
+
+---
+
+# 6.30 Option 8 — `time_window`
+
+`time_window` creates a window based on elapsed time rather than a fixed number of results.
+
+Classic SPL:
+
+```spl
+| streamstats time_window=5m count AS events_5m
+```
+
+This means:
+
+> Calculate using the events inside a five-minute time window.
+
+The direction of the incoming results matters:
+
+```text
+Ascending `_time`
+    → the window represents the previous time period
+
+Descending `_time`
+    → the window represents the next time period
+```
+
+So "previous" or "next" is determined by the order in which `streamstats` receives the results, not merely by how the timestamps look on screen.
+
+For example:
+
+```text
+_time   event
+------  -----
+10:00   A
+10:01   B
+10:04   C
+10:07   D
+```
+
+With:
+
+```spl
+| streamstats time_window=5m count AS events_5m
+```
+
+the calculation is driven by the timestamps rather than by "last N rows."
+
+This is very different from:
+
+```spl
+| streamstats window=5 count
+```
+
+because five events do not necessarily represent five minutes.
+
+### Important requirement
+
+For `time_window`, the events must be sorted in ascending or descending `_time` order.
+
+For a normal chronological investigation:
+
+```spl
+| sort 0 _time
+```
+
+is usually the clearest choice.
+
+Classic SPL supports `time_window`. Current SPL2 `streamstats` does not have an equivalent option. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats citehttps://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+
+---
+
+# 6.31 `window` vs `time_window`
+
+This distinction deserves its own rule.
+
+### `window=5`
+
+```spl
+| streamstats window=5 count AS count_5
+```
+
+means:
+
+```text
+Last 5 RESULTS
+```
+
+### `time_window=5m`
+
+```spl
+| streamstats time_window=5m count AS count_5m
+```
+
+means:
+
+```text
+Events in the relevant 5-MINUTE TIME WINDOW
+```
+
+These are not interchangeable.
+
+Example:
+
+```text
+10:00  event 1
+10:00  event 2
+10:01  event 3
+10:01  event 4
+10:02  event 5
+10:15  event 6
+```
+
+At 10:15:
+
+```text
+window=5
+    → can still use five recent results
+
+time_window=5m
+    → uses only events inside the five-minute time range
+```
+
+This distinction is crucial for security detections.
+
+If your rule says:
+
+> "5 attempts"
+
+use an event-count window.
+
+If your rule says:
+
+> "5 attempts in 5 minutes"
+
+use a time-based window.
+
+---
+
+# 6.32 Combining `window` and `time_window`
+
+Classic SPL allows both:
+
+```spl
+| streamstats time_window=5m window=100 count AS events
+```
+
+This gives you a time-based window while also limiting the maximum number of events considered.
+
+Think:
+
+```text
+5 minutes
+    +
+maximum 100 results
+```
+
+This can be useful when a very high-volume source produces many events in a short period.
+
+Current Splunk documentation explicitly states that `window` can be used with `time_window` to specify a maximum number of events in the time window. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.33 Option 9 — `allnum`
+
+`allnum` is a classic-SPL option.
+
+```spl
+| streamstats allnum=true avg(bytes) AS avg_bytes
+```
+
+It controls whether numerical statistics are calculated when all values in the relevant set are numeric.
+
+Example data:
+
+```text
+event   bytes
+-----   -----
+1       100
+2       200
+3       N/A
+4       400
+```
+
+With:
+
+```spl
+| streamstats window=3 allnum=true avg(bytes) AS avg_bytes
+```
+
+the calculation is only produced for a numerical set when every value being considered is numeric.
+
+Without `allnum=true`, numerical statistics can operate according to the normal statistical-function behavior.
+
+The practical lesson is:
+
+```text
+allnum=false
+    → default numeric behavior
+
+allnum=true
+    → require all values in the calculation to be numeric
+```
+
+This option is useful when data quality is inconsistent and you do not want mixed-type data participating silently in a numerical calculation.
+
+SPL2 does not provide an `allnum` option for `streamstats`. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.34 Option 10 — Aggregation Functions
+
+`streamstats` is not limited to `sum()`.
+
+You can use statistical and event-order functions.
+
+Common examples:
+
+```spl
+| streamstats count AS n
+| streamstats sum(bytes) AS running_bytes
+| streamstats avg(bytes) AS running_avg
+| streamstats min(bytes) AS min_bytes
+| streamstats max(bytes) AS max_bytes
+| streamstats range(bytes) AS byte_range
+| streamstats stdev(bytes) AS byte_stdev
+```
+
+You can also use event-order functions:
+
+```spl
+| streamstats current=false last(src_ip) AS previous_ip
 ```
 
 and:
 
-```text
-current=f
+```spl
+| streamstats first(action) AS first_action
 ```
 
-`current=f` [false: do not include the current result in the calculation] means the current bucket is not included in its own baseline.
+Multivalue functions include:
 
-SPL2 can use the corresponding `streamstats` syntax:
-
-```spl2
-| streamstats window=6 current=false avg(current) AS baseline
+```spl
+| streamstats values(src_ip) AS seen_ips
 ```
 
-Current SPL2 documentation defines `window` as the number of events/results used for the calculation and `current=false` as excluding the current result from the calculation. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+and:
+
+```spl
+| streamstats list(src_ip) AS ip_sequence
+```
+
+Current Splunk documentation lists aggregate functions such as `avg`, `count`, `distinct_count`, `estdc`, percentiles, `max`, `median`, `min`, `mode`, `range`, `stdev`, `sum`, `var`; event-order functions such as `earliest`, `first`, `last`, `latest`; and multivalue functions such as `list` and `values`. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+The exact function behavior follows the corresponding Splunk statistical-function definition.
 
 ---
 
-# 6.20 Turning a Timechart Into a Baseline Search
+# 6.35 `count` in `streamstats`
 
-A practical pattern is:
+A common beginner question is:
 
-### Traditional SPL
+```spl
+| streamstats count
+```
+
+What does it mean?
+
+It creates a running event counter.
+
+Example:
+
+```spl
+| makeresults count=5
+| streamstats count AS event_number
+```
+
+Result:
+
+```text
+event_number
+------------
+1
+2
+3
+4
+5
+```
+
+This is different from:
+
+```spl
+| stats count
+```
+
+which gives one final number:
+
+```text
+count
+-----
+5
+```
+
+SPL2 uses:
+
+```spl2
+| streamstats count()
+```
+
+while classic SPL commonly uses:
+
+```spl
+| streamstats count
+```
+
+Both represent the same conceptual operation in their respective syntaxes. Current SPL2 documentation explicitly demonstrates `streamstats count()` as a running count. citehttps://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/streamstats-command/streamstats-command-examples
+
+---
+
+# 6.36 Processing Order Is Critical
+
+`streamstats` is order-sensitive.
+
+Suppose:
+
+```text
+_time
+-----
+10:00
+10:01
+10:02
+10:03
+```
+
+and you run:
+
+```spl
+| streamstats current=false last(_time) AS previous_time
+```
+
+"previous" means:
+
+> Previous result in the stream.
+
+It does not automatically mean:
+
+> Earlier timestamp in chronological order.
+
+Therefore, for chronological analysis, use:
+
+```spl
+| sort 0 _time
+```
+
+before `streamstats` when necessary.
+
+For example:
+
+```spl
+index=windows EventCode=4625
+| sort 0 _time
+| streamstats current=false last(_time) AS previous_time BY src_ip
+| eval gap=_time-previous_time
+| table _time src_ip previous_time gap
+```
+
+Now `previous_time` represents the previous event in chronological order for that `src_ip`.
+
+This is especially important when using:
+
+```text
+current=false
+time_window
+reset_on_change
+previous-event logic
+```
+
+because all of these depend on the sequence of incoming results.
+
+---
+
+# 6.37 Using `streamstats` After `timechart`
+
+A powerful pattern is:
+
+```text
+raw events
+    ↓
+timechart
+    ↓
+one row per time bucket
+    ↓
+streamstats
+    ↓
+running / rolling calculation over those buckets
+```
+
+Example:
 
 ```spl
 index=windows EventCode=4625
 | timechart span=10m count AS current
-| streamstats window=6 current=f avg(current) AS baseline
-```
-
-The logic is:
-
-```text
-Raw events
-   ↓
-10-minute buckets
-   ↓
-current count
-   ↓
-previous 6 buckets
-   ↓
-baseline average
-```
-
-### SPL2
-
-```spl2
-search index=windows EventCode=4625
-| timechart span=10m count() AS current
 | streamstats window=6 current=false avg(current) AS baseline
 ```
 
-Now each row can conceptually contain:
+Now `streamstats` is no longer processing individual Windows events.
+
+It is processing the **10-minute time buckets produced by `timechart`**.
+
+Example:
 
 ```text
-_time     current    baseline
---------------------------------
-10:00       10          null
-10:10       12          10
-10:20        9          11
-10:30       11        10.33
-10:40       13        10.5
-10:50       80        11
+_time   current   baseline
+------  -------   --------
+10:00   10        null
+10:10   12        10
+10:20    9        11
+10:30   11        10.33
+10:40   13        10.5
+10:50   80        11
 ```
 
-The spike is now visible as:
+At 10:50:
 
 ```text
 current  = 80
 baseline = 11
 ```
 
-This is the Splunk equivalent of the rolling-baseline concept from the original chapter.
+This makes the spike much easier to identify.
+
+This is an important `streamstats` principle:
+
+> `streamstats` works on whatever results arrive from the previous command.
+
+Splunk explicitly documents that `streamstats` can process results produced by transforming commands such as `stats`, `chart`, and `timechart`. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
 
 ---
 
-# 6.21 `streamstats window` vs `time_window`
+# 6.38 Example — Rolling Average
 
-Traditional SPL has two different window concepts in `streamstats`:
-
-```text
-window=N
-```
-
-and:
+Suppose these are already time buckets:
 
 ```text
-time_window=<time span>
+bucket   events
+------   ------
+1        10
+2        12
+3         9
+4        11
+5        13
+6        80
 ```
 
-`window=N` is based on the number of results.
-
-`time_window` is based on time.
-
-For example:
+Search:
 
 ```spl
-| streamstats window=6 avg(bytes) AS avg_bytes
+| streamstats window=3 avg(events) AS rolling_avg
 ```
 
-uses a result-count window.
-
-Whereas:
-
-```spl
-| streamstats time_window=1h avg(bytes) AS avg_bytes
-```
-
-uses a one-hour time window.
-
-The current SPL2 `streamstats` documentation lists `window` but explicitly identifies `time_window` as an SPL option without an SPL2 equivalent.
-
-Therefore:
+Result:
 
 ```text
-Traditional SPL
-    window
-    time_window
-
-SPL2
-    window
-    no time_window equivalent in the current command reference
+bucket  events  rolling_avg
+------  ------  -----------
+1       10      10
+2       12      11
+3        9      10.33
+4       11      10.67
+5       13      11
+6       80      34.67
 ```
 
-This is a good example of why we are studying SPL and SPL2 together instead of assuming every command option exists in both languages. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+If you do not want the current bucket in the baseline:
+
+```spl
+| streamstats window=3 current=false avg(events) AS baseline
+```
+
+Result conceptually:
+
+```text
+bucket  events  baseline
+------  ------  --------
+1       10      null
+2       12      10
+3        9      11
+4       11      10.33
+5       13      10.67
+6       80      11
+```
+
+This is often better for anomaly comparison because the current spike does not inflate its own baseline.
 
 ---
 
-# 6.22 Moving Average With `trendline` in Traditional SPL
+# 6.39 Example — Conditional Sliding Event Count
 
-Traditional SPL also has a dedicated command:
+A very useful SOC pattern is to turn a condition into a numeric indicator and then use `streamstats`.
 
-```text
-trendline
-```
-
-It computes moving averages such as:
+Suppose each event has:
 
 ```text
-sma
-ema
-wma
+action = success
+or
+action = failure
 ```
 
-where:
-
-```text
-sma = simple moving average
-ema = exponential moving average
-wma = weighted moving average
-```
-
-For example:
+Create:
 
 ```spl
-index=windows EventCode=4625
-| timechart span=10m count AS current
-| trendline sma5(current) AS baseline
+| eval is_failure=if(action="failure",1,0)
 ```
 
-This is another native way to create a moving baseline in traditional SPL.
+Then:
 
-We will not treat `trendline` as an SPL2 equivalent here; the current official reference for the command is in the traditional SPL search-command documentation.
+```spl
+| streamstats window=5 sum(is_failure) AS failures_last_5
+```
 
-Splunk documents `trendline` as a command for moving averages. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/10.2/search-commands/trendline
+Now every event carries the number of failures in the last five results.
+
+Example:
+
+```text
+action    is_failure    failures_last_5
+-------   -----------   ---------------
+failure       1                 1
+failure       1                 2
+success       0                 2
+failure       1                 3
+failure       1                 4
+success       0                 3
+```
+
+To exclude the current event:
+
+```spl
+| streamstats window=5 current=false sum(is_failure) AS previous_failures
+```
+
+This pattern is conceptually close to a sliding-window detection:
+
+```text
+event
+  ↓
+turn condition into 1/0
+  ↓
+streamstats window=N
+  ↓
+count/sum recent matching events
+```
+
+For a real time-based rule, use:
+
+```spl
+| sort 0 _time
+| streamstats time_window=5m sum(is_failure) AS failures_5m
+```
+
+This asks:
+
+> How many failed events occurred in the relevant five-minute window?
 
 ---
 
-# 6.23 `sparkline()` — A Small Time Series Inside a Summary
+# 6.40 Example — Previous Event With `last()`
 
-Sometimes you do not want a full timechart.
+`streamstats` is useful when the current event must be compared with an earlier event.
 
-You want a summary table such as:
+Example:
+
+```spl
+index=network
+| sort 0 _time
+| streamstats current=false last(src_ip) AS previous_src_ip
+| eval changed=if(src_ip!=previous_src_ip,1,0)
+| table _time src_ip previous_src_ip changed
+```
+
+Another common example:
+
+```spl
+| streamstats current=false last(_time) AS previous_time BY src_ip
+| eval gap=_time-previous_time
+```
+
+Now:
 
 ```text
-host     events   trend
---------------------------
-DC01       810    ▁▂▂▃▇▂
-DC02       220    ▁▁▂▂▃▁
-DC03       140    ▁▂▁▁▁▁
+_time   src_ip       previous_time   gap
+------  -----------  --------------  ----
+10:00   10.0.0.5     null            null
+10:01   10.0.0.5     10:00           60
+10:04   10.0.0.5     10:01          180
+10:15   10.0.0.5     10:04          660
 ```
 
-SPL2 provides `sparkline()` as a statistical function.
+The `gap` field tells you how long it had been since the previous event for that IP.
 
-For example:
-
-```spl2
-FROM windows
-| stats count() AS Events,
-        sparkline(count(), 10m) AS Trend
-  BY host
-```
-
-The idea is:
-
-```text
-stats summary
-    +
-small time trend
-```
-
-Current SPL2 documentation defines `sparkline()` as generating time-based trend displays within search results and supports it with `stats` and `streamstats`. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/statistical-and-charting-functions/time-functions
+This is a building block for session-like analysis.
 
 ---
 
-# 6.24 Comparing the Same Time Period Across Days or Weeks
+# 6.41 Example — Creating Session-Like Groups With `streamstats`
 
-Another time question is:
+Suppose you define a new session whenever the gap between events is greater than five minutes.
 
-> Is today's activity similar to yesterday's?
-
-or:
-
-> How does this week compare with the previous weeks?
-
-The native Splunk tool for this is:
-
-```text
-timewrap
-```
-
-For example:
-
-### Traditional SPL
+A practical pattern is:
 
 ```spl
-index=windows EventCode=4625
-| timechart span=1h count
-| timewrap 1d
-```
-
-### SPL2
-
-```spl2
-search index=windows EventCode=4625
-| timechart span=1h count()
-| timewrap 1d
-```
-
-`timewrap` takes the output from `timechart` and creates separate series for previous periods.
-
-This answers a different question from a rolling baseline:
-
-```text
-timechart + streamstats
-    ↓
-How unusual is the current value compared with recent buckets?
-
- timechart + timewrap
-    ↓
-How does this period compare with the same position in earlier periods?
-```
-
-Splunk's current SPL2 documentation defines `timewrap` as wrapping timechart output so different periods become different series. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/timewrap-command/timewrap-command-overview-syntax-and-usage
-
----
-
-# 6.25 `delta` — Difference Between Nearby Results
-
-Another useful time-oriented operation is measuring the difference between adjacent results.
-
-Traditional SPL provides:
-
-```spl
-| delta field AS change
-```
-
-For example:
-
-```spl
-index=windows
-| timechart span=10m count AS current
-| delta current AS change
+index=web
+| sort 0 src_ip _time
+| streamstats current=false last(_time) AS previous_time BY src_ip
+| eval gap=_time-previous_time
+| eval new_session=if(isnull(previous_time) OR gap>300,1,0)
+| streamstats sum(new_session) AS session_id BY src_ip
+| table _time src_ip gap new_session session_id
 ```
 
 Conceptually:
 
 ```text
-previous = 100
-current  = 140
-change   = 40
+same IP
+   ↓
+measure gap
+   ↓
+gap > 300 seconds?
+   ↓
+yes → new_session=1
+no  → new_session=0
+   ↓
+running sum
+   ↓
+session_id
 ```
 
-The important detail is that `delta` compares results in the **search order**, not automatically in chronological order. Therefore, if the order matters, make the ordering explicit before using it.
+This gives you session-like groups without using `transaction`.
 
-Splunk documents `delta` as calculating the difference between the current result and a previous result in search order. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.0/search-commands/delta
-
-We will use `streamstats` more heavily for sequence analysis later, so `delta` is an additional tool rather than the center of this chapter.
+For larger or more complex event-correlation problems, compare this approach carefully with `transaction`, because `transaction` has explicit grouping controls such as `maxpause` and `maxspan`.
 
 ---
 
-# 6.26 Fixed Buckets vs Rolling Windows vs Period Comparison
+# 6.42 Example — Reset After a Reboot
 
-At this point, we have several different meanings of "time."
+This is a clean example of state [the accumulated value carried from previous events].
 
-### Fixed interval
+```spl
+index=system
+| streamstats reset_after="(action=\"REBOOT\")" sum(bytes) AS total_bytes BY host
+| table _time host action bytes total_bytes
+```
+
+Suppose:
+
+```text
+host  action       bytes
+----  -----------  -----
+A     LOGON        100
+A     DOWNLOAD     400
+A     REBOOT        50
+A     LOGON        100
+```
+
+Result:
+
+```text
+host  action       bytes  total_bytes
+----  -----------  -----  -----------
+A     LOGON        100    100
+A     DOWNLOAD     400    500
+A     REBOOT        50     550
+A     LOGON        100    100
+```
+
+The reboot event is included in the old total because the reset is `after`.
+
+Change it to `reset_before`:
+
+```spl
+| streamstats reset_before="(action=\"REBOOT\")" sum(bytes) AS total_bytes BY host
+```
+
+and the reboot starts the new total:
+
+```text
+host  action       bytes  total_bytes
+----  -----------  -----  -----------
+A     LOGON        100    100
+A     DOWNLOAD     400    500
+A     REBOOT        50     50
+A     LOGON        100    150
+```
+
+This is the cleanest way to remember the difference.
+
+---
+
+# 6.43 Example — Reset When the Source Changes
+
+Suppose events arrive in order by `src_ip` and you want to reset whenever the IP changes.
+
+```spl
+| sort 0 src_ip _time
+| streamstats count BY src_ip reset_on_change=true AS sequence
+```
+
+Conceptually:
+
+```text
+src_ip       sequence
+-----------  --------
+10.0.0.1        1
+10.0.0.1        2
+10.0.0.1        3
+10.0.0.2        1
+10.0.0.2        2
+10.0.0.3        1
+```
+
+`reset_on_change` is about a change in the incoming `BY` value, so ordering must match the way you want the runs to be interpreted.
+
+Splunk's official example demonstrates the same DAY/NIGHT behavior. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.44 SPL vs SPL2 — `streamstats` Options
+
+For this command, the differences are worth memorizing.
+
+| Feature | Classic SPL | SPL2 |
+|---|---|---|
+| `current` | ✅ | ✅ |
+| `window` | ✅ | ✅ |
+| `BY` | ✅ | ✅ |
+| `reset_before` | ✅ | ✅, changed syntax |
+| `reset_after` | ✅ | ✅, changed syntax |
+| `reset_on_change` | ✅ | ✅, expressed as `onchange` |
+| `time_window` | ✅ | ❌ |
+| `global` | ✅ | ❌ |
+| `allnum` | ✅ | ❌ |
+
+Classic SPL:
+
+```spl
+| streamstats reset_before="(action=\"REBOOT\")" window=5 current=false sum(bytes) AS total BY host
+```
+
+SPL2:
+
+```spl2
+| streamstats current=false reset before action="REBOOT" window=5 sum(bytes) AS total BY host
+```
+
+Classic SPL reset syntax:
+
+```text
+reset_before="("<eval-expression>")"
+reset_after="("<eval-expression>")"
+reset_on_change=true
+```
+
+SPL2 reset syntax:
+
+```text
+reset before <expression>
+      after <expression>
+      onchange
+```
+
+SPL2 no longer uses separate classic-SPL reset arguments and does not have equivalents for `allnum`, `global`, or `time_window`. citehttps://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+
+---
+
+# 6.45 A Complete `streamstats` Option Map
+
+Keep this table as your quick reference.
+
+```text
+current=true
+    → include the current result
+
+current=false
+    → exclude the current result
+
+window=N
+    → use a result-count window
+
+time_window=5m
+    → use a time-based window
+      (classic SPL only)
+
+BY field
+    → maintain separate calculations by group
+
+global=true
+    → one shared window across BY groups
+      (classic SPL only)
+
+global=false
+    → separate event window for each BY group
+      (classic SPL only)
+
+reset_before=<condition>
+    → reset before calculating the matching event
+
+reset_after=<condition>
+    → calculate the matching event, then reset
+
+reset_on_change=true
+    → reset when a BY value changes
+      (classic SPL)
+
+allnum=true
+    → require numerical values for numerical statistics
+      (classic SPL only)
+```
+
+The official SPL reference lists these classic options and their defaults; the current SPL2 reference lists the reduced option set and changed reset syntax. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats citehttps://help.splunk.com/en/splunk-cloud-platform/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
+
+---
+
+# 6.46 Common `streamstats` Mistakes
+
+### Mistake 1 — Thinking `streamstats` is the same as `stats`
+
+Wrong mental model:
+
+```text
+streamstats = stats
+```
+
+Better:
+
+```text
+stats
+    → final/grouped aggregate
+
+streamstats
+    → aggregate attached progressively to each result
+```
+
+### Mistake 2 — Forgetting order
+
+This:
+
+```spl
+| streamstats current=false last(_time) AS previous_time
+```
+
+depends on the order of incoming results.
+
+If you need chronological behavior:
+
+```spl
+| sort 0 _time
+```
+
+first.
+
+### Mistake 3 — Confusing `window` with `time_window`
+
+```text
+window=5
+    → five results
+
+time_window=5m
+    → five minutes
+```
+
+### Mistake 4 — Using the current result in its own baseline
+
+This:
+
+```spl
+| streamstats window=6 avg(current) AS baseline
+```
+
+includes the current result.
+
+For a previous-bucket baseline:
+
+```spl
+| streamstats window=6 current=false avg(current) AS baseline
+```
+
+### Mistake 5 — Forgetting that `window` also interacts with reset
+
+When `reset_before`, `reset_after`, or `reset_on_change` is combined with `window`, the window is reset when the accumulation is reset. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+### Mistake 6 — Expecting `time_window` in SPL2
+
+Classic SPL:
+
+```spl
+| streamstats time_window=5m count
+```
+
+SPL2:
+
+```text
+No direct streamstats time_window option
+```
+
+Do not copy classic-SPL options into SPL2 without checking the command reference.
+
+### Mistake 7 — Writing a Boolean condition incorrectly in classic SPL
+
+This:
+
+```spl
+reset_before=reset_flag
+```
+
+is not the documented classic syntax.
+
+Use a Boolean expression in the reset clause, for example:
+
+```spl
+reset_before="(action=\"REBOOT\")"
+```
+
+or:
+
+```spl
+reset_before="(match(_raw,\"oracle.*\"))"
+```
+
+Classic SPL requires the documented reset expression format. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.47 Performance and Memory
+
+`streamstats` keeps state in memory while calculating running or windowed statistics.
+
+The important configuration limits include:
+
+```text
+max_stream_window
+maxresultrows
+max_mem_usage_mb
+```
+
+Current Splunk documentation lists `max_stream_window` with a default of 10,000 for `streamstats`. The search processor also uses `maxresultrows` and `max_mem_usage_mb` to control the amount of result and memory state it can maintain. citehttps://help.splunk.com/en/splunk-enterprise/administer/admin-manual/10.4/configuration-file-reference/10.4.0-configuration-file-reference/limits.conf citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+For example:
+
+```spl
+| streamstats window=500000 sum(bytes)
+```
+
+should not be treated as harmless simply because the syntax is valid.
+
+Large windows can consume significant memory.
+
+Practical habits:
+
+```text
+Filter first
+    ↓
+Reduce unnecessary events
+    ↓
+Choose the smallest useful window
+    ↓
+Use BY only when it helps the detection
+```
+
+Do not change `limits.conf` just to make an oversized search work unless you understand the memory impact.
+
+---
+
+# 6.48 Real SOC Example — Brute-Force Detection
+
+Question:
+
+> Did a source IP generate many failed logons in a short period?
+
+Start with the event filter:
+
+```spl
+index=windows EventCode=4625
+| sort 0 _time
+```
+
+Create a failure indicator:
+
+```spl
+| eval is_failure=1
+```
+
+Count recent failures by IP:
+
+```spl
+| streamstats time_window=5m sum(is_failure) AS failures_5m BY src_ip
+```
+
+Now each event can carry the number of failures associated with that IP in the current five-minute window.
+
+You can then threshold [set a value above which an alert or investigation is triggered]:
+
+```spl
+| where failures_5m >= 10
+```
+
+The important architecture is:
+
+```text
+failed-logon events
+       ↓
+sort chronologically
+       ↓
+one event = one failure
+       ↓
+5-minute streamstats window
+       ↓
+group BY src_ip
+       ↓
+count failures
+       ↓
+threshold
+```
+
+This is an example of why `streamstats` is useful for security analytics.
+
+---
+
+# 6.49 `reset_after` Can Use a Calculated Field
+
+A reset expression can reference a field produced by `streamstats`.
+
+For example, reset after the running count reaches three:
+
+```spl
+| streamstats count AS n reset_after="(n>=3)"
+```
+
+Conceptually:
+
+```text
+event 1 → n=1
+event 2 → n=2
+event 3 → n=3 → reset after this event
+event 4 → n=1
+event 5 → n=2
+event 6 → n=3 → reset after this event
+```
+
+This is useful when the reset condition depends on the result of the aggregation itself, rather than directly on an input field.
+
+The expression capability is documented for `reset_after`, including references to fields returned by `streamstats`. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.3/search-commands/streamstats
+
+---
+
+# 6.50 Real SOC Example — Password Spray Pattern
+
+Password spraying [trying a small number of passwords against many accounts] is different from repeated failures against one account.
+
+Suppose the important fields are:
+
+```text
+src_ip
+user
+action
+_time
+```
+
+You can build a per-IP rolling count:
+
+```spl
+index=windows EventCode=4625
+| sort 0 _time
+| eval failure=1
+| streamstats time_window=10m sum(failure) AS failures_10m BY src_ip
+```
+
+Then investigate IPs with a high number of failures:
+
+```spl
+| where failures_10m >= 20
+```
+
+A second dimension can then be examined, such as the number of distinct users:
+
+```spl
+| eventstats dc(user) AS unique_users BY src_ip
+| where failures_10m >= 20 AND unique_users >= 10
+```
+
+The detection logic is conceptually:
+
+```text
+many failures
+      +
+many targeted users
+      +
+same source IP
+      +
+short time interval
+      ↓
+password-spray hypothesis
+```
+
+The search does not prove malicious activity by itself. It identifies a pattern for investigation.
+
+---
+
+# 6.51 Fixed Buckets vs `streamstats` Windows vs `timewrap`
+
+Now compare the major time-analysis mechanisms.
+
+### Fixed bucket
 
 Question:
 
@@ -1074,604 +2580,311 @@ Question:
 
 Use:
 
-```text
-SPL
-bin + stats
-
-SPL2
-stats ... BY _time span=10m
-
-Both
- timechart span=10m ...
+```spl
+| bin _time span=10m
+| stats count AS Events BY _time
 ```
 
-### Rolling calculation
+or:
+
+```spl
+| timechart span=10m count
+```
+
+### Running / rolling calculation
 
 Question:
 
-> Is this bucket unusual compared with the previous six buckets?
+> What is the current value compared with recent results?
 
 Use:
 
-```text
-streamstats window=6
+```spl
+| streamstats window=6 ...
 ```
+
+or:
+
+```spl
+| streamstats time_window=10m ...
+```
+
+in classic SPL.
 
 ### Historical period comparison
 
 Question:
 
-> How does today compare with the same time yesterday?
+> How does today compare with yesterday?
 
 Use:
-
-```text
-timechart + timewrap
-```
-
-These are different analytical questions.
-
----
-
-# 6.27 Session-Like Activity: Not a Direct `session()` Translation
-
-The original CrowdStrike chapter used a `session()` function to create groups based on gaps in activity.
-
-Do not copy that function name into Splunk.
-
-Traditional SPL provides the `transaction` command for grouping conceptually related events across time, including constraints such as:
-
-```text
-maxpause
-maxspan
-maxevents
-startswith
-endswith
-```
-
-For example:
-
-```spl
-index=web
-| transaction clientip maxpause=5m maxspan=30m
-```
-
-This means events for the same `clientip` can be grouped into a transaction when the time constraints are satisfied.
-
-Splunk documents `maxpause` as the maximum allowed pause between events and `maxspan` as the maximum overall transaction duration. citehttps://help.splunk.com/en/splunk-enterprise/spl-search-reference/9.4/search-commands/transaction
-
----
-
-# 6.28 `transaction` Is Not the Same as `stats`
-
-This distinction is extremely important.
-
-`stats` answers questions such as:
-
-```text
-How many events?
-What is the average?
-What is the sum?
-```
-
-It collapses the events into a statistical result.
-
-`transaction` is intended to group related events into transaction objects while retaining event-level information such as the combined raw events and transaction duration/event count.
-
-Splunk explicitly recommends using `stats` instead of `transaction` when you only need aggregate statistics and grouping by fields is sufficient, because `stats` is generally more efficient. `transaction` becomes useful when grouping depends on time gaps, start/end conditions, reused identifiers, or when the combined raw event content is important. citehttps://help.splunk.com/en/splunk-cloud-platform/search/search-manual/10.4.2604/group-and-correlate-events/about-transactions
-
-Therefore:
-
-```text
-Need statistics?
-    ↓
-stats
-
-Need complex event grouping across time?
-    ↓
-transaction
-```
-
-For SPL2, do not invent a `session()` command simply because the CrowdStrike example had one. We will use the documented SPL2 commands, especially `streamstats`, for session-like logic where appropriate.
-
----
-
-# 6.29 A Real SOC Example — Failed-Logon Attack Waves
-
-Suppose the question is:
-
-> Did one source IP generate repeated failed-logon waves?
-
-Traditional SPL can use `transaction`:
-
-```spl
-index=windows EventCode=4625
-| transaction src_ip maxpause=5m
-| table _time src_ip duration eventcount
-```
-
-This is asking Splunk to create time-gap-based groups.
-
-But if the question is simply:
-
-> How many failures came from each source IP?
-
-do not use `transaction`.
-
-Use:
-
-```spl
-index=windows EventCode=4625
-| stats count AS Attempts BY src_ip
-| sort -Attempts
-```
-
-This is a key decision:
-
-```text
-Count / aggregate
-    ↓
-stats
-
-Time-gap transaction
-    ↓
-transaction
-```
-
----
-
-# 6.30 Session-Like Logic With `streamstats`
-
-There is another important pattern that will matter in later sequence analysis.
-
-You can use `streamstats` to maintain state across events.
-
-For example:
-
-```spl
-| streamstats current=f last(_time) AS previous_time BY src_ip
-```
-
-Conceptually:
-
-```text
-Current event
-     ↓
-What was the previous event time for this IP?
-```
-
-You can then calculate a gap:
-
-```spl
-| eval gap=_time-previous_time
-```
-
-This creates a building block for detecting activity gaps without using `transaction`.
-
-SPL2 also supports `streamstats`, including `BY` grouping and reset conditions. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/streamstats-command/streamstats-command-overview-syntax-and-usage
-
-The more advanced session-building patterns will belong in the later **sequence/correlation** chapter, so we will not duplicate them here.
-
----
-
-# 6.31 A Practical Time Analysis Workflow
-
-When you have a time-based SOC question, follow this process.
-
-```text
-1. Define the search time range
-        ↓
-2. Filter to the relevant events
-        ↓
-3. Decide what "time" means
-        ↓
-4. Choose the correct time operation
-        ↓
-5. Aggregate or compare
-        ↓
-6. Visualize or investigate the abnormal periods
-```
-
-For example:
-
-> Find failed logon spikes during the last 24 hours.
-
-Think:
-
-```text
-LAST 24 HOURS
-       ↓
-FAILED LOGONS
-       ↓
-10-MINUTE BUCKETS
-       ↓
-COUNT
-       ↓
-TIMECHART
-```
-
-Traditional SPL:
-
-```spl
-index=windows EventCode=4625 earliest=-24h
-| timechart span=10m count AS FailedLogons
-```
-
-SPL2:
-
-```spl2
-search index=windows EventCode=4625 earliest=-24h
-| timechart span=10m count() AS FailedLogons
-```
-
----
-
-# 6.32 Common Mistake — Treating `span` as Decoration
-
-This is one of the most important lessons in the chapter.
-
-These searches are both valid:
-
-```spl
-| timechart span=1m count
-```
-
-and:
 
 ```spl
 | timechart span=1h count
+| timewrap 1d
 ```
 
-But they ask different questions about the data.
-
-If the behavior occurs in a three-minute burst, a one-hour span may hide the burst inside a large aggregate.
-
-Therefore:
+The three operations answer different questions:
 
 ```text
-Detection interval
-      ↓
-Choose span deliberately
-```
+Fixed clock interval
+    → bin / stats span / timechart
 
-Splunk's timechart documentation confirms that `span` controls the size of the time bins and that automatic spans depend on the time range. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/timechart-command/timechart-command-usage
+Recent rolling state
+    → streamstats
 
----
-
-# 6.33 Common Mistake — Assuming `bucket` Is a Function Like LogScale
-
-Do not write a LogScale-style mental model such as:
-
-```text
-bucket(...)
-```
-
-and expect that to be the normal Splunk syntax.
-
-Traditional SPL uses:
-
-```spl
-| bin _time span=10m
-```
-
-and `bucket` is an alias:
-
-```spl
-| bucket _time span=10m
-```
-
-SPL2 can use:
-
-```spl2
-| bin _time span=10m
-```
-
-or, more naturally for statistics:
-
-```spl2
-| stats count() BY _time span=10m
-```
-
-or:
-
-```spl2
-FROM windows
-GROUP BY span(_time, 10m)
-SELECT count(), _time
-```
-
-Splunk explicitly documents these SPL/SPL2 differences. citehttps://help.splunk.com/en/splunk-enterprise/search/spl-search-reference/10.4/search-commands/bucket citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/stats-command/stats-command-overview-syntax-and-usage
-
----
-
-# 6.34 Common Mistake — Using `timechart` Without Thinking About Series
-
-Consider:
-
-```spl
-| timechart span=10m count BY host
-```
-
-If your environment has thousands of hosts, you may create a very large number of series.
-
-`timechart` supports series limits and other options for controlling the number of split-by series returned.
-
-For example, the current SPL2 documentation exposes a `limit` option for split-by series.
-
-Do not automatically chart every possible value of a high-cardinality field [high cardinality: a field with a very large number of distinct values].
-
-Instead ask:
-
-```text
-Which dimension actually helps the investigation?
-```
-
-Splunk documents split-by series limits and the `limit` option for `timechart`. citehttps://help.splunk.com/en/splunk-enterprise/search/spl2-search-reference/timechart-command/timechart-command-overview-and-syntax
-
----
-
-# 6.35 Common Mistake — Confusing Event Time With Index Time
-
-From Chapter 1 we learned:
-
-```text
-_time
-```
-
-is the event timestamp, while:
-
-```text
-_indextime
-```
-
-is associated with when Splunk indexed the event.
-
-Time-based detections normally use `_time`, because the investigation usually asks:
-
-> When did the activity happen?
-
-But ingestion-delay investigations may compare:
-
-```spl
-| eval delay_sec=_indextime-_time
-```
-
-Do not use `_indextime` for a normal event timeline unless your actual question concerns ingestion or indexing delay.
-
----
-
-# 6.36 Common Mistake — Filtering After Time Aggregation
-
-Suppose you want failed logons from one host.
-
-Prefer filtering the raw events before the time aggregation when the filter describes the event itself.
-
-Traditional SPL:
-
-```spl
-index=windows EventCode=4625 host=DC01
-| timechart span=10m count
-```
-
-not:
-
-```spl
-index=windows EventCode=4625
-| timechart span=10m count BY host
-| search host=DC01
-```
-
-The second approach can be useful in some circumstances, but it creates the time series for more hosts before filtering it.
-
-The general principle is the same one we learned in Chapter 5:
-
-```text
-Filter the raw events as early as practical
-       ↓
-Then aggregate
+Same position in an earlier period
+    → timewrap
 ```
 
 ---
 
-# 6.37 The Complete Mental Model
+# 6.52 The Complete `streamstats` Mental Model
 
-Now your investigation can look like this:
-
-```text
-             INVESTIGATION QUESTION
-                       |
-                       v
-                DEFINE TIME RANGE
-                       |
-                       v
-                    FILTER
-                       |
-                       v
-             WHAT DOES "TIME" MEAN?
-                       |
-       +---------------+----------------+
-       |               |                |
-       v               v                v
-   FIXED SLICE     ROLLING VIEW    PERIOD COMPARISON
-       |               |                |
-       v               v                v
-bin / bucket      streamstats       timewrap
-stats span        window            + timechart
- timechart
-       |
-       +---------------+----------------+
-                       |
-                       v
-                  AGGREGATE
-                       |
-                       v
-                 INVESTIGATE SPIKES
-```
-
-And for session-like event grouping in traditional SPL:
+Think of `streamstats` as a stateful calculator moving through results.
 
 ```text
-EVENTS
-   ↓
-FILTER
-   ↓
-transaction
-   ↓
-maxpause / maxspan / startswith / endswith
-   ↓
-TRANSACTION RESULTS
+             EVENT 1
+                |
+                v
+        calculate current state
+                |
+                v
+         output EVENT 1 + state
+                |
+             EVENT 2
+                |
+                v
+        update current state
+                |
+                v
+         output EVENT 2 + state
+                |
+             EVENT 3
+                |
+                v
+        update current state
+                |
+                v
+         output EVENT 3 + state
 ```
 
-The central decision is:
+The state can be:
 
-> **What exactly does “time” mean in my question?**
+```text
+count
+sum
+average
+minimum
+maximum
+previous value
+latest value
+list of values
+distinct count
+...
+```
+
+And the state can be controlled by:
+
+```text
+current
+window
+BY
+reset_before
+reset_after
+reset_on_change
+time_window
+global
+allnum
+```
+
+The most important mental model is:
+
+```text
+streamstats
+    =
+process each incoming result
+    +
+maintain statistical state
+    +
+write the current state back to that result
+```
 
 ---
 
-# 6.38 Chapter Summary
+# 6.53 `streamstats` Learning Sequence
 
-In this chapter, we moved from ordinary event searching to time-based analysis.
+For learning, do not memorize all options at once.
+
+Use this progression:
+
+```text
+1. streamstats count
+        ↓
+2. streamstats sum(bytes)
+        ↓
+3. current=true / false
+        ↓
+4. window=3
+        ↓
+5. BY user
+        ↓
+6. window + BY
+        ↓
+7. reset_before
+        ↓
+8. reset_after
+        ↓
+9. reset_on_change
+        ↓
+10. time_window
+        ↓
+11. global
+        ↓
+12. allnum
+        ↓
+13. previous-event logic
+        ↓
+14. rolling baseline
+        ↓
+15. sliding-window detection
+        ↓
+16. session-like correlation
+```
+
+Once these are comfortable, `streamstats` becomes much easier to use in SOC searches.
+
+---
+
+# 6.54 Chapter Summary
 
 ### Search time range
-
-Traditional SPL:
 
 ```spl
 index=windows earliest=-1h latest=now
 ```
 
-SPL2:
-
-```spl2
-FROM windows
-WHERE earliest=-1h AND latest=now
-```
-
-### Fixed time grouping
-
-Traditional SPL:
+### Fixed time bucket
 
 ```spl
 | bin _time span=10m
 | stats count AS Events BY _time
 ```
 
-SPL2:
-
-```spl2
-| stats count() AS Events BY _time span=10m
-```
-
-or:
-
-```spl2
-FROM windows
-GROUP BY span(_time, 10m)
-SELECT count() AS Events, _time
-```
-
 ### Time-series chart
-
-Traditional SPL:
 
 ```spl
 | timechart span=10m count
 ```
 
-SPL2:
+### Running calculation
 
-```spl2
-| timechart span=10m count()
+```spl
+| streamstats count AS n
+```
+
+### Running sum
+
+```spl
+| streamstats sum(bytes) AS running_bytes
+```
+
+### Exclude current result
+
+```spl
+| streamstats current=false sum(bytes) AS previous_total
+```
+
+### Fixed event-count window
+
+```spl
+| streamstats window=5 avg(bytes) AS avg_bytes
+```
+
+### Separate calculation by group
+
+```spl
+| streamstats window=5 sum(bytes) AS total BY src_ip
+```
+
+### Reset before a condition
+
+```spl
+| streamstats reset_before="(action=\"REBOOT\")" sum(bytes) AS total
+```
+
+### Reset after a condition
+
+```spl
+| streamstats reset_after="(action=\"REBOOT\")" sum(bytes) AS total
+```
+
+### Reset when the BY value changes
+
+```spl
+| streamstats count BY user reset_on_change=true
+```
+
+### Time-based window — classic SPL
+
+```spl
+| streamstats time_window=5m count AS events_5m
 ```
 
 ### Rolling baseline
 
-Traditional SPL:
-
 ```spl
-| streamstats window=6 current=f avg(current) AS baseline
-```
-
-SPL2:
-
-```spl2
+| timechart span=10m count AS current
 | streamstats window=6 current=false avg(current) AS baseline
 ```
 
-### Historical period comparison
-
-```text
-timechart + timewrap
-```
-
-### Session-like grouping
-
-Traditional SPL:
+### Previous event
 
 ```spl
-| transaction src_ip maxpause=5m
+| streamstats current=false last(_time) AS previous_time BY src_ip
 ```
 
-The important distinction is:
+### Conditional sliding count
+
+```spl
+| eval failure=if(action="failure",1,0)
+| streamstats window=5 sum(failure) AS failures_last_5
+```
+
+The key decision is:
 
 ```text
-Fixed clock slice
-    → bin / stats span / timechart
+What question am I asking?
 
-Rolling calculation
+How many overall?
+    → stats
+
+How many in each fixed time bucket?
+    → bin + stats / timechart
+
+What is the running or recent value?
     → streamstats
 
-Compare with previous periods
+What happened immediately before this result?
+    → streamstats current=false + last()
+
+When should the accumulated state restart?
+    → reset_before / reset_after / reset_on_change
+
+How many occurred in a time interval?
+    → time_window in classic SPL
+
+How does this period compare with an earlier period?
     → timewrap
-
-Time-gap transaction grouping
-    → transaction (traditional SPL)
 ```
+
+The central idea remains:
+
+> **`streamstats` is about carrying statistical state from one result to the next.**
 
 ---
 
-# What You Should Remember
-
-If you remember only these points:
-
-```text
-_time
-→ When did the event happen?
-
-earliest / latest
-→ Which time range should be searched?
-
-span
-→ How wide is each time bucket?
-
-bin / bucket
-→ Put values into fixed groups in traditional SPL
-
-stats ... BY _time span=...
-→ Native SPL2 time grouping
-
-timechart
-→ Time-series visualization + aggregation
-
-streamstats
-→ Running / moving calculations
-
-timewrap
-→ Compare different time periods
-
-transaction
-→ Group related events across time in traditional SPL
-```
-
-And the most important question is:
-
-> **Is my investigation asking about a fixed interval, a recent rolling baseline, a historical comparison, or a time-gap-based session?**
-
-Once that decision becomes automatic, time-based SPL and SPL2 searches become much easier to construct.
-
----
-
-# Progress So Far
+# 6.55 Progress So Far
 
 ```text
 CHAPTER 1
@@ -1697,9 +2910,14 @@ Sequence & Correlation
 (test, streamstats, state, event relationships)
 ```
 
+Chapter 7 should build on the `streamstats` concepts learned here rather than re-teaching the command from the beginning.
+
 ---
 
 # Official Splunk Documentation Used for This Chapter
+
+This chapter was expanded and checked against current official Splunk documentation for `streamstats`, including classic SPL and SPL2 option differences. The examples above distinguish documented syntax from illustrative SOC detection patterns.
+
 
 The chapter follows the current official Splunk documentation for:
 
