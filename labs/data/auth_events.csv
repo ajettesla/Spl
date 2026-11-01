@@ -1,0 +1,39 @@
+_time,_raw,host,source,sourcetype,index,user,EventCode,LogonType,src_ip,process_name,CommandLine,bytes_in,bytes_out,status,action
+2026-01-15 08:00:01,"Jan 15 08:00:01 DC01 EventCode=4625 User=alice LogonType=3 SourceIP=10.0.0.5",DC01,WinEventLog:Security,windows,alice,4625,3,10.0.0.5,,,,,failure
+2026-01-15 08:00:15,"Jan 15 08:00:15 DC01 EventCode=4625 User=alice LogonType=3 SourceIP=10.0.0.5",DC01,WinEventLog:Security,windows,alice,4625,3,10.0.0.5,,,,,failure
+2026-01-15 08:00:30,"Jan 15 08:00:30 DC01 EventCode=4625 User=alice LogonType=3 SourceIP=10.0.0.5",DC01,WinEventLog:Security,windows,alice,4625,3,10.0.0.5,,,,,failure
+2026-01-15 08:00:45,"Jan 15 08:00:45 DC01 EventCode=4625 User=alice LogonType=3 SourceIP=10.0.0.5",DC01,WinEventLog:Security,windows,alice,4625,3,10.0.0.5,,,,,failure
+2026-01-15 08:01:00,"Jan 15 08:01:00 DC01 EventCode=4624 User=alice LogonType=3 SourceIP=10.0.0.5",DC01,WinEventLog:Security,windows,alice,4624,3,10.0.0.5,,,,,success
+2026-01-15 08:05:00,"Jan 15 08:05:00 DC01 EventCode=4625 User=bob LogonType=3 SourceIP=10.0.0.10",DC01,WinEventLog:Security,windows,bob,4625,3,10.0.0.10,,,,,failure
+2026-01-15 08:05:10,"Jan 15 08:05:10 DC01 EventCode=4625 User=bob LogonType=3 SourceIP=10.0.0.10",DC01,WinEventLog:Security,windows,bob,4625,3,10.0.0.10,,,,,failure
+2026-01-15 08:05:20,"Jan 15 08:05:20 DC01 EventCode=4624 User=bob LogonType=3 SourceIP=10.0.0.10",DC01,WinEventLog:Security,windows,bob,4624,3,10.0.0.10,,,,,success
+2026-01-15 08:10:00,"Jan 15 08:10:00 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:05,"Jan 15 08:10:05 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:10,"Jan 15 08:10:10 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:15,"Jan 15 08:10:15 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:20,"Jan 15 08:10:20 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:25,"Jan 15 08:10:25 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:30,"Jan 15 08:10:30 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:35,"Jan 15 08:10:35 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:40,"Jan 15 08:10:40 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:45,"Jan 15 08:10:45 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:50,"Jan 15 08:10:50 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:10:55,"Jan 15 08:10:55 DC02 EventCode=4625 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4625,3,192.168.1.100,,,,,failure
+2026-01-15 08:11:00,"Jan 15 08:11:00 DC02 EventCode=4624 User=charlie LogonType=3 SourceIP=192.168.1.100",DC02,WinEventLog:Security,windows,charlie,4624,3,192.168.1.100,,,,,success
+2026-01-15 08:15:00,"Jan 15 08:15:00 WEB01 process=powershell.exe cmd=\"powershell -enc AQAA\" user=alice",WEB01,WinEventLog:Security,windows,alice,4688,,,,"powershell.exe","powershell -enc AQAA",,,,
+2026-01-15 08:15:05,"Jan 15 08:15:05 WEB01 process=cmd.exe cmd=\"cmd /c whoami\" user=bob",WEB01,WinEventLog:Security,windows,bob,4688,,,,"cmd.exe","cmd /c whoami",,,,
+2026-01-15 08:20:00,"Jan 15 08:20:00 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54321 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:01,"Jan 15 08:20:01 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54322 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:02,"Jan 15 08:20:02 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54323 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:03,"Jan 15 08:20:03 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54324 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:04,"Jan 15 08:20:04 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54325 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:05,"Jan 15 08:20:05 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54326 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:06,"Jan 15 08:20:06 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54327 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:07,"Jan 15 08:20:07 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54328 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:08,"Jan 15 08:20:08 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54329 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:09,"Jan 15 08:20:09 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54330 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:20:10,"Jan 15 08:20:10 FW01 src=10.0.0.5 dst=8.8.8.8 sport=54331 dport=53 bytes_in=120 bytes_out=80 action=allow",FW01,firewall,firewall,,,,,,,,,120,80,allow,allow
+2026-01-15 08:25:00,"Jan 15 08:25:00 DC01 EventCode=4688 process=cmd.exe parent=winword.exe user=alice cmd=\"cmd /c powershell -enc...\"",DC01,WinEventLog:Security,windows,alice,4688,,,,"cmd.exe","cmd /c powershell -enc...",,,,
+2026-01-15 08:25:05,"Jan 15 08:25:05 DC01 EventCode=4688 process=powershell.exe parent=cmd.exe user=alice cmd=\"powershell -enc...\"",DC01,WinEventLog:Security,windows,alice,4688,,,,"powershell.exe","powershell -enc...",,,,
+2026-01-15 08:30:00,"Jan 15 08:30:00 DC01 EventCode=1102 user=admin action=cleared Security log",DC01,WinEventLog:System,windows,admin,1102,,,,,,,,,
+2026-01-15 08:30:10,"Jan 15 08:30:10 DC01 EventCode=4688 process=wevtutil.exe user=admin cmd=\"wevtutil cl Security\"",DC01,WinEventLog:Security,windows,admin,4688,,,,"wevtutil.exe","wevtutil cl Security",,,,
