@@ -1,1373 +1,1193 @@
 # Splunk SPL + SPL2
 
-# Chapter 4 — Selecting, Renaming, Sorting, and Limiting Results
+# Chapter 4 — Search Commands Reference (Classified) & Time-Based Analysis
 
-So far, we have learned how to find the events that matter and how to search text and patterns. This chapter moves from **finding events** to **shaping the results** so an analyst can actually work with them.
+> **Goal**: Look up any command — see its classification, syntax, and key behaviors instantly. Master time as a first-class dimension with streaming commands.
 
-For example:
+---
 
-### Traditional SPL
+## 4.1 Classification Badges
+
+| Badge | Meaning |
+|-------|---------|
+| 🟢 **DIST-STREAM** | Distributed streaming (runs on indexers) |
+| 🟡 **CENT-STREAM** | Centralized streaming (search head only) |
+| 🔴 **REPORTING** | Non-streaming / reporting (events → summary) |
+| 🟣 **GENERATING** | Generating command (creates event stream) |
+| 🟠 **ORCHESTRATING** | Pipeline control / multi-dataset |
+| 🔵 **PIPELINE-ONLY** | Edge/Ingest Processor pipeline only |
+| ⚪ **CUSTOM** | Custom command type |
+
+---
+
+## 4.2 Search Commands Reference (Classified)
+
+### 4.2.1 Generating Commands 🟣
+
+#### `search` / Implicit Search
+```
+🟣 GENERATING | 🟢 DIST-STREAM (generating phase)
+```
+**Purpose**: Retrieve events from index
 ```spl
-index=windows
-| search FileName="powershell.exe"
+# Traditional SPL (implicit)
+index=windows EventCode=4625
+
+# Explicit
+search index=windows EventCode=4625 earliest=-1h
 ```
-
-### SPL2
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-```
-
-Those searches answer:
-
-> Which events match my condition?
-
-Now suppose each event contains many fields and your search returns thousands of events. You may only want a focused result containing time, host, user, process, and command line.
-
-This chapter therefore answers four practical questions:
-
-```text
-Which fields should I see?
-What should those fields be called?
-In what order should the results appear?
-How many results should I return?
-```
-
-The important Splunk-specific point is that **SPL and SPL2 have several ways to shape results**, and the syntax and semantics are not always identical.
+**Key**: Implicit at start of traditional SPL pipeline. Keyword syntax on `_raw`.
 
 ---
 
-# 4.1 Finding Data vs Shaping Data
+#### `from` (SPL2)
+```
+🟣 GENERATING | 🟢 DIST-STREAM
+```
+**Purpose**: Retrieve from dataset (index, lookup, datamodel)
+```spl2
+# Pipeline
+search index=windows WHERE EventCode=4625
 
-The filtering concepts were covered in the previous chapters, so we will not repeat them here.
+# Structured
+FROM windows WHERE EventCode=4625
+FROM main WHERE sourcetype="cisco:asa"
+FROM lookup:my_lookup WHERE key="value"
+```
 
-### Traditional SPL
+---
+
+#### `inputlookup`
+```
+🟣 GENERATING | 🟢 DIST-STREAM
+```
+**Purpose**: Load lookup table as events
 ```spl
-index=windows
-| search FileName="powershell.exe"
-```
-
-### SPL2
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-```
-
-These searches find events.
-
-Now suppose the resulting events contain:
-
-```text
-_time
-host
-source
-sourcetype
-user
-FileName
-CommandLine
-ProcessId
-ParentProcessId
-hash
-...
-```
-
-You may only want:
-
-```text
-_time
-host
-user
-FileName
-CommandLine
-```
-
-That is result shaping.
-
-Think of the workflow as:
-
-```text
-FILTER
-   ↓
-Which events?
-
-FIELD SELECTION
-   ↓
-Which fields?
-
-RENAME
-   ↓
-What should the fields be called?
-
-SORT
-   ↓
-What order?
-
-LIMIT
-   ↓
-How many rows?
+| inputlookup my_lookup
+| inputlookup my_lookup WHERE status="active"
+| inputlookup my_lookup MAXRESULTS=10000
 ```
 
 ---
 
-# 4.2 Traditional SPL: `table`
-
-In traditional SPL, `table` is an easy way to create a focused tabular result.
-
+#### `inputcsv`
+```
+🟣 GENERATING | 🟡 CENT-STREAM (file on search head)
+```
+**Purpose**: Load CSV file as events
 ```spl
-index=windows
-| search FileName="powershell.exe"
-| table _time host user FileName CommandLine
+| inputcsv mydata.csv
 ```
-
-This tells Splunk to display these fields in this order.
-
-For example:
-
-```text
-_time                  host   user          FileName          CommandLine
---------------------------------------------------------------------------
-10:15:22               DC01   administrator powershell.exe    powershell -enc ...
-10:18:47               DC02   alice         powershell.exe    powershell -nop ...
-```
-
-`table` is especially useful when you are preparing readable output for an investigation, report, or dashboard.
-
-Splunk documents `table` as a command for specifying which fields appear in the results and their order.
 
 ---
 
-# 4.3 Traditional SPL: `fields`
-
-Traditional SPL also provides the `fields` command.
-
-To keep fields:
-
+#### `makeresults`
+```
+🟣 GENERATING | 🟡 CENT-STREAM
+```
+**Purpose**: Generate synthetic events for testing
 ```spl
-index=windows
-| search FileName="powershell.exe"
-| fields _time host user FileName CommandLine
+| makeresults count=5
+| makeresults count=1 data="test"
 ```
 
-To remove fields:
+---
 
+#### `metadata` / `typeahead` / `rest` / `savedsearch`
+```
+🟣 GENERATING | Various
+```
+| Command | Purpose |
+|---------|---------|
+| `metadata` | Index metadata (hosts, sources, sourcetypes) |
+| `typeahead` | Search-time typeahead |
+| `rest` | Splunk REST API query |
+| `savedsearch` | Execute saved search |
+
+---
+
+### 4.2.2 Filtering Commands 🟢
+
+#### `where` 🟢
+```
+🟢 DIST-STREAM
+```
+**Purpose**: Boolean expression filter per event
 ```spl
-| fields - _raw
+# SPL
+| where src_ip=dest_ip
+| where bytes > 1000000
+| where match(CommandLine, "(?i)powershell")
+| where user IN ("admin","root","administrator")
+
+# SPL2
+| where src_ip=dest_ip
+WHERE src_ip=dest_ip
 ```
 
-or:
+---
 
+#### `search` (filtering mode) 🟢
+```
+🟢 DIST-STREAM
+```
+**Purpose**: Keyword/field filter in pipeline
 ```spl
-| fields - debug_field temporary_field
+index=windows | search EventCode=4625
+index=windows | search "failed logon"
+index=windows | search CommandLine="*powershell*"
 ```
-
-The useful mental distinction is:
-
-```text
-table
-   ↓
-Focused tabular output
-
-fields
-   ↓
-Keep or remove fields from results
-```
-
-They can look similar in simple searches, but they are not the same command.
 
 ---
 
-# 4.4 SPL2: `SELECT`
-
-SPL2 introduces a structured projection [projection: choosing which fields or expressions appear in the result] through the `SELECT` clause.
-
-For example:
-
-```spl2
-SELECT _time, host, user, FileName, CommandLine
-FROM windows
-WHERE FileName="powershell.exe"
+#### `regex` (SPL only) 🟢
 ```
-
-The same search can be written in the `FROM`-first form:
-
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-SELECT _time, host, user, FileName, CommandLine
+🟢 DIST-STREAM
 ```
-
-SPL2 supports both forms.
-
-The important idea is:
-
-```text
-SELECT field1, field2, field3
-```
-
-means:
-
-> Return these fields or expressions.
-
-The current SPL2 documentation defines `SELECT` as a clause used to retrieve specific fields and, in searches, to evaluate expressions and aggregations.
-
----
-
-# 4.5 An Important SPL2 Difference: `SELECT` vs `fields`
-
-Do not treat these as exact synonyms.
-
-For example:
-
-```spl2
-FROM windows
-SELECT host, user, FileName
-```
-
-The `SELECT` clause restricts the fields returned and can remove unspecified internal fields.
-
-By contrast:
-
-```spl2
-FROM windows
-| fields host, user, FileName
-```
-
-uses the `fields` command, whose documented behavior retains the selected event fields while internal fields such as `_time` and `_raw` are included unless explicitly removed.
-
-This means that `SELECT` can have a more aggressive effect on the result shape.
-
-If `_time` or `_raw` is important, include it explicitly in the `SELECT` clause when needed.
-
-Splunk's current documentation specifically notes this difference.
-
----
-
-# 4.6 SPL2: `fields`
-
-SPL2 also supports the `fields` command.
-
-Keep fields:
-
-```spl2
-FROM windows
-| fields _time, host, user, FileName, CommandLine
-```
-
-Remove fields:
-
-```spl2
-FROM windows
-| fields - _raw, _indextime
-```
-
-A syntax difference that matters is the field separator.
-
-Traditional SPL commonly uses:
-
+**Purpose**: PCRE filter
 ```spl
-| fields host user FileName
+| regex CommandLine="(?i)powershell.*-enc"
+| regex _raw="error|fail"
 ```
-
-SPL2 requires the field list to be comma-delimited:
-
-```spl2
-| fields host, user, FileName
-```
-
-SPL2 also requires field names containing special characters to be quoted appropriately.
+**Note**: Not available in SPL2. Use `match()` in `where`/`WHERE`.
 
 ---
 
-# 4.7 `table` vs `fields` vs `SELECT`
-
-Keep this comparison in mind:
-
-| Purpose | Traditional SPL | SPL2 |
-|---|---|---|
-| Tabular output | `table _time host user` | `table _time, host, user` |
-| Keep fields | `fields _time host user` | `fields _time, host, user` |
-| Remove fields | `fields - _raw` | `fields - _raw` |
-| Select fields in structured syntax | — | `SELECT _time, host, user FROM windows` |
-
-These overlap, but they solve slightly different problems.
-
-A good mental model is:
-
-```text
-table
-   ↓
-Presentation-oriented table
-
-fields
-   ↓
-Field inclusion/exclusion
-
-SELECT
-   ↓
-SPL2 structured field/expression selection
+#### `CASE()` / `TERM()` 🟢
 ```
-
----
-
-# 4.8 `SELECT *`
-
-SPL2 supports:
-
-```spl2
-SELECT * FROM windows
+🟢 DIST-STREAM (search modifiers)
 ```
-
-and:
-
-```spl2
-FROM windows
-SELECT *
-```
-
-This is useful when you want to inspect the complete result structure before deciding which fields matter.
-
-You can also use wildcards for similar field names in the `SELECT` clause by enclosing the wildcard expression in single quotes, for example:
-
-```spl2
-SELECT 'host*' FROM windows
-```
-
-The current SPL2 documentation requires those quotes when the field name itself contains a wildcard.
-
----
-
-# 4.9 `SELECT DISTINCT`
-
-SPL2 also supports:
-
-```spl2
-SELECT DISTINCT host
-FROM windows
-WHERE FileName="powershell.exe"
-```
-
-This returns unique combinations of the selected values.
-
-For example, if the same host produced 500 matching events, the result can contain that host once rather than 500 event rows.
-
-Conceptually:
-
-```text
-Many events
-    ↓
-Repeated host values
-    ↓
-SELECT DISTINCT host
-    ↓
-Unique host values
-```
-
-This is useful for questions such as:
-
-> Which hosts had this activity?
-
-It belongs here because it is a result-selection operation; aggregation will be covered in Chapter 5.
-
----
-
-# 4.10 Renaming Fields in Traditional SPL
-
-Sometimes the source field name is not the name you want users to see.
-
-Traditional SPL provides the `rename` command.
-
-For example:
-
+**Purpose**: Case-sensitive / indexed-term matching
 ```spl
-index=windows
-| rename ComputerName AS Endpoint
+search CASE("ERROR")           # Case-sensitive
+search TERM(127.0.0.1)         # Match as single indexed term
 ```
-
-Now the result uses:
-
-```text
-Endpoint
-```
-
-instead of:
-
-```text
-ComputerName
-```
-
-You can rename several fields:
-
-```spl
-| rename ComputerName AS Endpoint, UserName AS User
-```
-
-Renaming here is a search-result operation. It does not rewrite the original indexed event.
 
 ---
 
-# 4.11 Renaming Fields in SPL2
+### 4.2.3 Streaming Transform Commands 🟢
 
-SPL2 supports the `AS` keyword when selecting fields or expressions.
-
-For example:
-
-```spl2
-SELECT host AS Endpoint,
-       user AS User
-FROM windows
+#### `eval` 🟢
 ```
-
-SPL2 also supports the `rename` command:
-
-```spl2
-FROM windows
-| rename host AS Endpoint
+🟢 DIST-STREAM
 ```
-
-Therefore:
-
-```text
-Traditional SPL
-rename old AS new
-
-SPL2 structured form
-SELECT old AS new
-
-SPL2 pipeline form
-| rename old AS new
+**Purpose**: Calculate/transform fields
+```spl
+| eval normalized=lower(user)
+| eval is_admin=if(user="admin",1,0)
+| eval _raw=replace(_raw, /password=\w+/, "password=****")
+| eval total=bytes_in+bytes_out
 ```
-
-Use the structured `SELECT ... AS ...` form when the rest of the query is already using the `FROM` clause style.
-
-The current SPL2 syntax uses `AS` for aliases and also documents the `rename` command.
 
 ---
 
-# 4.12 Renaming Calculated Results
-
-Renaming becomes particularly useful once aggregation is introduced.
-
-For example, SPL2 can name an aggregation directly:
-
-```spl2
-SELECT count() AS EventCount
-FROM windows
+#### `rex` 🟢
 ```
-
-Instead of leaving the output with a generated expression name, you now have:
-
-```text
-EventCount
+🟢 DIST-STREAM
 ```
-
-This becomes especially useful with `ORDER BY`, because you can sort on the clean alias.
-
-For example:
-
-```spl2
-FROM windows
-GROUP BY host
-SELECT host, count() AS EventCount
-ORDER BY EventCount DESC
+**Purpose**: Regex field extraction
+```spl
+| rex field=_raw "(?<ip>\d+\.\d+\.\d+\.\d+)"
+| rex field=CommandLine "(?<tool>powershell|pwsh|cscript)"
+| rex mode=sed "s/password=\w+/password=****/g"
 ```
-
-We will study `GROUP BY` and `count()` in Chapter 5.
 
 ---
 
-# 4.13 Sorting Results
-
-Suppose your search returns hundreds of events and you want the newest events first.
-
-Traditional SPL commonly uses:
-
+#### `replace` (via `eval`) 🟢
+```
+🟢 DIST-STREAM
+```
 ```spl
-| sort -_time
+| eval _raw=replace(_raw, /CreditCard=\d+/, "CreditCard=XXXX")
+| eval message=replace(message, "error", "ERROR")
 ```
 
-The `-` means descending order for that field.
+---
 
-For ascending order:
-
+#### `rename` 🟢
+```
+🟢 DIST-STREAM
+```
 ```spl
+| rename user AS Account, host AS Endpoint
+| rename "field with spaces" AS field_no_spaces
+```
+
+---
+
+#### `fields` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| fields _time host user EventCode      # Keep (comma in SPL2)
+| fields - _raw _indextime              # Remove
+```
+
+---
+
+#### `fillnull` / `filldown` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| fillnull value=0 bytes
+| fillnull value="unknown" user host
+| filldown user host                    # Fill with previous value
+```
+
+---
+
+#### `lookup` 🟢*
+```
+🟢 DIST-STREAM* (small lookups) | 🟡 CENT-STREAM (large lookups)
+```
+**Purpose**: Enrich events from lookup table
+```spl
+| lookup ip_reputation ip AS src_ip OUTPUT reputation, category
+| lookup user_assets user OUTPUT department, manager
+```
+*Large lookups force centralized execution.
+
+---
+
+### 4.2.4 Streaming Stats Commands 🟢
+
+#### `streamstats` 🟢
+```
+🟢 DIST-STREAM (windowed) | 🟡 CENT-STREAM (window=0 global=t)
+```
+**Purpose**: Running calculations per event
+```spl
+# Running count per user
+| streamstats count AS seq BY user
+
+# Moving average (5-event window)
+| streamstats window=5 current=f avg(bytes) AS moving_avg
+
+# Reset on condition
+| streamstats count(eval(action="failure")) AS failures
+    reset_after="(action=\"success\")"
+    BY user
+
+# SPL2 syntax differences
+| streamstats current=false reset before (action="success") count() BY user
+```
+
+---
+
+#### `eventstats` 🟡
+```
+🟡 CENT-STREAM
+```
+**Purpose**: Aggregate + attach to every event
+```spl
+# Per-host average bytes
+| eventstats avg(bytes) AS host_avg BY host
+| where bytes > host_avg          # Events above host average
+
+# Per-user unique IP count
+| eventstats dc(src_ip) AS user_uniq_ips BY user
+| where user_uniq_ips > 50        # Users with many source IPs
+```
+
+---
+
+#### `autoregress` 🟢
+```
+🟢 DIST-STREAM
+```
+**Purpose**: Copy previous event's field value
+```spl
+# Previous event's src_ip
+| autoregress src_ip AS prev_ip
+
+# 3 events ago
+| autoregress bytes p=3 AS bytes_3_ago
+
+# Range: 1 to 3 events ago
+| autoregress user p=1-3 AS user_1 user_2 user_3
+```
+
+---
+
+#### `delta` 🟢
+```
+🟢 DIST-STREAM
+```
+**Purpose**: Numeric difference from previous event
+```spl
+# Time difference between events
+| sort 0 _time
+| delta _time AS time_gap
+
+# Bytes change
+| delta bytes AS byte_delta
+
+# Compare with event 2 back
+| delta _time p=2 AS gap_2_events
+```
+
+---
+
+#### `accum` 🟢
+```
+🟢 DIST-STREAM
+```
+**Purpose**: Running sum
+```spl
+| accum bytes AS total_bytes
+| accum count AS event_number
+```
+
+---
+
+### 4.2.5 Centralized Streaming Commands 🟡
+
+#### `sort` 🟡
+```
+🟡 CENT-STREAM
+```
+```spl
+| sort -count
 | sort +_time
+| sort 0 -_time          # 0 = no limit
+| sort -count, +host
 ```
-
-Conceptually:
-
-```text
-ASC
- ↓
-earliest → latest
-
-DESC
- ↓
-latest → earliest
-```
-
-This is the traditional SPL pipeline form.
+**SPL2**: `ORDER BY count DESC, host ASC`
 
 ---
 
-# 4.14 SPL2: `ORDER BY`
-
-SPL2 adds an `ORDER BY` clause to the structured `FROM` syntax.
-
-For example:
-
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-ORDER BY _time DESC
+#### `head` / `tail` 🟡
 ```
-
-This means:
-
-> Sort the results by `_time`, newest first.
-
-Ascending order is:
-
-```spl2
-ORDER BY _time ASC
+🟡 CENT-STREAM
 ```
-
-The current SPL2 documentation defines `ORDER BY` as a clause that sorts on one or more expressions.
-
----
-
-# 4.15 SPL2 Still Has the `sort` Command
-
-Do not assume that `ORDER BY` replaced `sort` everywhere.
-
-SPL2 also supports the `sort` command in a pipeline:
-
-```spl2
-FROM windows
-| sort -_time
-```
-
-So SPL2 gives you two useful styles:
-
-```text
-Structured FROM syntax
-    ↓
-ORDER BY _time DESC
-
-Pipeline syntax
-    ↓
-| sort -_time
-```
-
-The first belongs to the `FROM` clause hierarchy; the second is a pipeline command.
-
----
-
-# 4.16 Sorting by Multiple Fields
-
-Suppose you want:
-
-1. Newest event first.
-2. For equal timestamps, host ascending.
-
-Traditional SPL:
-
-```spl
-| sort -_time host
-```
-
-SPL2 pipeline form:
-
-```spl2
-| sort -_time, host
-```
-
-SPL2 structured form:
-
-```spl2
-ORDER BY _time DESC, host ASC
-```
-
-This gives you:
-
-```text
-Primary sort
-    ↓
-_time DESC
-
-Tie-breaker
-    ↓
-host ASC
-```
-
----
-
-# 4.17 Lexicographical Sorting
-
-Sorting is not always numeric just because the values look numeric.
-
-For example, string ordering can produce something like:
-
-```text
-10
-100
-20
-3
-```
-
-because lexicographical [lexicographical: ordered according to character sequence rather than numeric magnitude] comparison is being used.
-
-This matters for fields such as ports, identifiers, or other values that may be stored as strings.
-
-SPL2 documents lexicographical sorting and also provides sort-type functions for certain data types.
-
----
-
-# 4.18 Sorting IP Addresses in SPL2
-
-An IP address is a useful example because string ordering is not the same as numerical IP ordering.
-
-SPL2 supports a type-oriented sort expression such as:
-
-```spl2
-| sort ip(src_ip)
-```
-
-This tells Splunk to compare the field using IP-address semantics rather than ordinary string ordering.
-
-The lesson is:
-
-```text
-Field appearance
-      ≠
-Data type used for sorting
-```
-
-When sort order matters, know what type of value you are sorting.
-
----
-
-# 4.19 Limiting Results With `head`
-
-Traditional SPL uses:
-
 ```spl
 | head 10
+| tail 5
+```
+**SPL2**: `LIMIT 10`, `OFFSET 20 LIMIT 10`
+
+---
+
+#### `reverse` 🟡
+```
+🟡 CENT-STREAM
+```
+```spl
+| reverse
 ```
 
-For example:
+---
 
+#### `dedup` 🟡
+```
+🟡 CENT-STREAM
+```
+```spl
+| dedup host
+| dedup host, user
+| dedup 2 host           # Keep 2 per host
+```
+
+---
+
+#### `sample` / `sampleratio` 🟡
+```
+🟡 CENT-STREAM
+```
+```spl
+| sampleratio 0.1        # 10% random sample
+| sample 100             # Exact count
+```
+
+---
+
+#### `transaction` 🟡
+```
+🟡 CENT-STREAM
+```
+**Purpose**: Group events into transactions
+```spl
+| transaction user maxspan=1h maxpause=5m startswith=eval(action="login") endswith=eval(action="logout")
+```
+**Warning**: Memory intensive. Prefer `streamstats` for sequence detection.
+
+---
+
+### 4.2.6 Reporting / Non-Streaming Commands 🔴
+
+#### `stats` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| stats count BY user, host
+| stats sum(bytes) AS total, avg(bytes) AS avg, dc(src_ip) AS uniq_ips BY host
+| stats values(CommandLine) AS cmds BY user   # High cardinality risk!
+```
+
+---
+
+#### `chart` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| chart count BY user, host      # Pivot table
+| chart sum(bytes) BY host, _time span=1h
+```
+
+---
+
+#### `timechart` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| timechart span=1h count BY user
+| timechart span=5m avg(bytes) BY host
+| timechart span=1h limit=10 useother=f count BY action
+```
+
+---
+
+#### `top` / `rare` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| top limit=10 user
+| rare limit=5 host
+```
+
+---
+
+#### `sistats` / `sichart` / `sitimechart` 🔴
+```
+🔴 REPORTING (Summary Index format)
+```
+```spl
+| sistats count BY user, host
+| collect index=summary
+```
+
+---
+
+#### `geom` / `geostats` / `cluster` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| geostats latfield=lat longfield=lon count BY city
+| cluster t=0.9
+```
+
+---
+
+### 4.2.7 Orchestrating Commands 🟠
+
+#### `join` / `selfjoin` 🟠
+```
+🟠 ORCHESTRATING | 🟡 CENT-STREAM
+```
+```spl
+| join user [ search index=auth | stats count BY user ]
+| selfjoin user
+```
+
+---
+
+#### `append` / `appendpipe` / `appendcols` 🟠
+```
+🟠 ORCHESTRATING | 🟡 CENT-STREAM
+```
+```spl
+| append [ search index=windows EventCode=4624 ]
+| appendpipe [ stats count ]
+| appendcols [ search index=perf | stats avg(cpu) ]
+```
+
+---
+
+#### `map` 🟠
+```
+🟠 ORCHESTRATING | 🟡 CENT-STREAM
+```
+```spl
+| map search="search index=windows user=$user$ | head 1"
+```
+
+---
+
+#### `foreach` 🟠
+```
+🟠 ORCHESTRATING | SPL2
+```
+```spl2
+| foreach * [ eval <<FIELD>>=upper(<<FIELD>>) ]
+```
+
+---
+
+### 4.2.8 Dataset Processing Commands (SPL2)
+
+#### `union` / `diff` / `intersect`
+```
+🟠 ORCHESTRATING | SPL2
+```
+```spl2
+| union [ FROM windows ], [ FROM linux ]
+| diff [ FROM windows ], [ FROM linux ]
+| intersect [ FROM windows ], [ FROM linux ]
+```
+
+---
+
+### 4.2.9 Structure Commands 🟢
+
+#### `mvexpand` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| mvexpand user
+| mvexpand mvfield limit=100
+```
+
+---
+
+#### `expand` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| expand array_field
+```
+
+---
+
+#### `flatten` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| flatten object_field
+```
+
+---
+
+#### `mvcombine` / `mvfilter` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| mvcombine delim="," user
+| mvfilter match(user, "admin.*")
+```
+
+---
+
+### 4.2.10 Lookup & Enrichment Commands
+
+#### `lookup` (see 4.2.3) 🟢/🟡
+
+#### `outputlookup` 🟡
+```
+🟡 CENT-STREAM
+```
+```spl
+| outputlookup my_lookup
+| outputlookup my_lookup append=true
+```
+
+---
+
+#### `lookup_editor` / `inputlookup` (see 4.2.1)
+
+---
+
+### 4.2.11 Geospatial Commands 🔴
+
+#### `iplocation` 🟢
+```
+🟢 DIST-STREAM
+```
+```spl
+| iplocation src_ip
+| iplocation dest_ip prefix=dest_
+```
+
+---
+
+#### `geom` / `geostats` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| geom geo_countries featureIdField=country
+| geostats latfield=lat longfield=lon count BY city
+```
+
+---
+
+### 4.2.12 Machine Learning Commands 🔴
+
+#### `fit` / `apply` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| fit LogisticRegression target from feature1 feature2 INTO model_v1
+| apply model_v1
+```
+
+---
+
+#### `kmeans` / `anomalydetection` 🔴
+```
+🔴 REPORTING
+```
+```spl
+| kmeans k=3 feature1 feature2
+| anomalydetection _time, bytes
+```
+
+---
+
+### 4.2.13 Pipeline-Only Commands (Edge/Ingest Processor) 🔵
+
+| Command | Purpose | Syntax |
+|---------|---------|--------|
+| `route` | Divert subset to another path | `route predicate [ \| into $dest ]` |
+| `thru` | Copy + continue main path | `thru [ \| into $dest ]` |
+| `branch` | Split into independent paths | `branch [path1], [path2], ...` |
+| `if` | Conditional processing | `if (cond) [ ... ] elseif [ ... ] else [ ... ]` |
+
+```spl2
+$pipeline = | from $source
+    | where profile != "debug"
+    | route profile="linux" [ | into $linux_dest ]
+    | thru [ | into $archive_dest ]
+    | branch
+        [ | into $prod_dest ]
+        [ | into $dev_dest ]
+    ;
+```
+
+---
+
+### 4.2.14 Custom Command Types ⚪
+
+| Type | Generating | Streaming | Reporting |
+|------|------------|-----------|-----------|
+| **Input** | None | Events | Events |
+| **Output** | Events | Events | Summary |
+| **Runs on** | Search head | Indexers (if distributed) | Search head |
+| **Memory** | O(1) | O(1) per event | O(groups) |
+| **Use case** | Data connectors | Enrichment, parsing, filter | Custom agg, ML |
+
+**Configuration** (`commands.conf`):
+```ini
+[my_streaming_cmd]
+type = streaming
+distributed = true
+local = false
+streaming = true
+supports_multivalues = true
+
+[my_reporting_cmd]
+type = reporting
+distributed = false
+local = true
+```
+
+---
+
+## 4.3 Quick Lookup Table
+
+| Command | Class | SPL | SPL2 Pipeline | SPL2 Structured | Pipeline (EP/IP) |
+|---------|-------|-----|---------------|-----------------|------------------|
+| `search` | 🟣 | ✅ | ✅ | ❌ | ✅ |
+| `from` | 🟣 | ❌ | ✅ | ✅ | ✅ ($source) |
+| `where` | 🟢 | ✅ | ✅ | ✅ (WHERE) | ✅ |
+| `eval` | 🟢 | ✅ | ✅ | ✅ (EVAL) | ✅ |
+| `rex` | 🟢 | ✅ | ✅ | ❌ | ✅ |
+| `fields` | 🟢 | ✅ | ✅ (comma) | ✅ (SELECT) | ✅ |
+| `rename` | 🟢 | ✅ | ✅ | ✅ (AS in SELECT) | ✅ |
+| `lookup` | 🟢/🟡 | ✅ | ✅ | ❌ | ✅ |
+| `streamstats` | 🟢/🟡 | ✅ | ✅ | ❌ | ✅ |
+| `eventstats` | 🟡 | ✅ | ✅ | ❌ | ✅ |
+| `autoregress` | 🟢 | ✅ | ✅ | ❌ | ✅ |
+| `delta` | 🟢 | ✅ | ✅ | ❌ | ✅ |
+| `sort` | 🟡 | ✅ | ✅ | ✅ (ORDER BY) | ❌ |
+| `head` | 🟡 | ✅ | ✅ | ✅ (LIMIT) | ❌ |
+| `dedup` | 🟡 | ✅ | ✅ | ❌ | ✅ |
+| `stats` | 🔴 | ✅ | ✅ | ✅ (GROUP BY/SELECT) | ✅ |
+| `chart` | 🔴 | ✅ | ✅ | ❌ | ❌ |
+| `timechart` | 🔴 | ✅ | ✅ | ❌ | ❌ |
+| `join` | 🟠 | ✅ | ✅ | ✅ (JOIN clause) | ❌ |
+| `append` | 🟠 | ✅ | ✅ | ❌ | ❌ |
+| `route` | 🔵 | ❌ | ❌ | ❌ | ✅ |
+| `thru` | 🔵 | ❌ | ❌ | ❌ | ✅ |
+| `branch` | 🔵 | ❌ | ❌ | ❌ | ✅ |
+| `if` | 🔵 | ❌ | ✅ | ❌ | ✅ |
+
+---
+
+## 4.4 Time-Based Analysis & Streaming Commands
+
+> **Goal**: Master time as a first-class dimension. Understand `streamstats`, `eventstats`, `autoregress`, `delta` for sequence detection.
+
+---
+
+### 4.5 Time as a First-Class Dimension
+
+Time isn't just a filter — it's an analytical dimension.
+
+```
+Three time operations:
+━━━━━━━━━━━━━━━━━━━━━━━
+1. LIMIT time range        → earliest/latest, WHERE earliest=...
+2. BUCKET time             → bin/span, timechart
+3. COMPUTE over time       → streamstats, eventstats, autoregress, delta
+```
+
+---
+
+### 4.6 Search Time Range: `earliest`/`latest` vs `WHERE`
+
+#### Traditional SPL
+```spl
+index=windows earliest=-1h latest=now
+index=windows earliest=-24h@h latest=@h
+```
+
+#### SPL2 Pipeline
+```spl2
+search index=windows earliest=-1h latest=now
+```
+
+#### SPL2 Structured
+```spl2
+FROM windows WHERE earliest=-1h AND latest=now
+```
+
+#### Relative Time Syntax
+| Specifier | Meaning |
+|-----------|---------|
+| `-15m` | Last 15 minutes |
+| `-1h` | Last hour |
+| `-24h` | Last 24 hours |
+| `-7d` | Last 7 days |
+| `-1h@h` | Last hour, snapped to hour boundary |
+| `-1d@d` | Last day, snapped to day boundary |
+| `now` | Search start time |
+
+---
+
+### 4.7 Time Bucketing: `bin`/`bucket` vs `span`
+
+#### Traditional SPL
 ```spl
 index=windows
-| search FileName="powershell.exe"
-| sort -_time
-| head 10
+| bin _time span=10m
+| stats count BY _time
+
+# bucket is alias
+| bucket _time span=1h
 ```
 
-This means:
+#### SPL2 Pipeline
+```spl2
+search index=windows
+| bin _time span=10m
+| stats count() BY _time
 
-```text
-Find events
-   ↓
-Sort newest first
-   ↓
-Return the first 10
+# SPL2 exclusive: span in stats
+search index=windows
+| stats count() BY _time span=10m
 ```
 
-SPL2 also supports the `head` command:
-
+#### SPL2 Structured
 ```spl2
 FROM windows
-| sort -_time
-| head 10
+GROUP BY span(_time, 10m)
+SELECT _time, count() AS count
 ```
 
-So `head` is one command that remains available in both SPL and SPL2.
+#### Span Options
+| Span | Use Case |
+|------|----------|
+| `1m` / `5m` / `10m` | High-resolution alerting |
+| `1h` | Hourly trending |
+| `1d` | Daily reporting |
+| `1w` | Weekly patterns |
 
 ---
 
-# 4.20 Why Sorting Before `head` Matters
+### 4.8 `timechart` Deep Dive
 
-Compare:
+#### Traditional SPL
+```spl
+index=windows EventCode=4625
+| timechart span=1h count BY user
+
+# With options
+| timechart span=1h limit=10 useother=f count BY user
+| timechart span=1h avg(bytes) BY host
+| timechart span=5m dc(src_ip) AS uniq_ips
+```
+
+#### SPL2 Pipeline
+```spl2
+search index=windows EventCode=4625
+| timechart span=1h count() BY user
+| timechart span=1h limit=10 useother=false count() BY user
+```
+
+#### Key Options
+| Option | Description |
+|--------|-------------|
+| `span` | Bucket size (required or auto) |
+| `limit` | Top N series (default 10) |
+| `useother` | Aggregate rest into `OTHER` (default true) |
+| `usenull` | Include null series (default true) |
+
+#### `timechart` vs `stats` + `span`
+
+| Aspect | `timechart` | `stats` + `span` |
+|--------|-------------|------------------|
+| Output | Time-series (guaranteed `_time` column) | Generic table |
+| Visualization | Native chart support | Requires manual chart config |
+| Fill gaps | ✅ Fills empty buckets with 0/null | ❌ Only buckets with data |
+| Split-by | One field | Multiple fields |
+
+---
+
+### 4.9 `stats` with Time Span (SPL2 Exclusive)
+
+```spl2
+# No bin needed!
+search index=windows
+| stats count() BY _time span=10m
+
+# Multiple aggregations
+search index=network
+| stats sum(bytes) AS total, dc(src_ip) AS uniq_ips BY _time span=1h, host
+```
+
+This is cleaner than `bin` + `stats` and avoids the extra pipeline step.
+
+---
+
+### 4.10 `streamstats`: Running Calculations
+
+**Classification**: 🟢 DIST-STREAM (windowed) | 🟡 CENT-STREAM (global)
+
+#### Core Concept
+```
+stats:        Events → [AGGREGATE] → Summary (fewer rows)
+streamstats:  Events → [RUNNING]   → Events + running state (same rows)
+```
+
+#### Basic Syntax
+```spl
+# Running count per user
+| streamstats count AS seq BY user
+
+# Running sum
+| streamstats sum(bytes) AS running_total BY host
+
+# Multiple aggregations
+| streamstats count AS events, sum(bytes) AS total, avg(bytes) AS avg BY user
+```
+
+#### Window Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `window=N` | Last N events | `window=10` |
+| `current=t/f` | Include current event | `current=false` |
+| `time_window=X` | Time-based window | `time_window=5m` |
+| `global=t/f` | Shared vs per-BY window | `global=false` |
+| `reset_before` | Reset before matching event | `reset_before="(action=\"success\")"` |
+| `reset_after` | Reset after matching event | `reset_after="(action=\"success\")"` |
+| `reset_on_change` | Reset when BY field changes | `reset_on_change=t` |
+
+#### Window vs Time Window Decision
+
+| Need | Use |
+|------|-----|
+| "Last 5 events" | `window=5` |
+| "Last 5 minutes" | `time_window=5m` |
+| "Last 5 events within 5 minutes" | `window=5 time_window=5m` |
+
+#### SPL2 Syntax Differences
+
+```spl2
+# SPL: reset_before="(action=\"success\")"
+# SPL2: reset before (action="success")
+
+| streamstats count() AS failures
+    reset after (action="success")
+    window=10
+    current=false
+    BY user
+```
+
+### Classic SPL Options Not in SPL2
+- `allnum` — numeric safety
+- `global` — merged into `reset` logic
+- `time_window` — not yet in SPL2 `streamstats`
+
+---
+
+### 4.11 `eventstats`: Aggregate Without Losing Events
+
+**Classification**: 🟡 CENT-STREAM
+
+#### Purpose
+Add aggregate columns to **every event** without collapsing.
 
 ```spl
-| head 10
-| sort -_time
+# Per-host average bytes
+| eventstats avg(bytes) AS host_avg BY host
+| where bytes > host_avg          # Events above host average
+
+# Per-user unique IP count
+| eventstats dc(src_ip) AS user_uniq_ips BY user
+| where user_uniq_ips > 50        # Users with many source IPs
 ```
 
-with:
+#### `stats` vs `eventstats` vs `streamstats`
+
+| Command | Output Rows | Use For |
+|---------|-------------|---------|
+| `stats` | 1 per group | Final summaries |
+| `eventstats` | Same as input | Compare event to group aggregate |
+| `streamstats` | Same as input | Running/sequential calculations |
+
+---
+
+### 4.12 `autoregress`: Previous Event Values
+
+**Classification**: 🟢 DIST-STREAM
+
+#### Purpose
+Copy field value from previous event(s) into current event.
 
 ```spl
-| sort -_time
-| head 10
+# Previous event's src_ip
+| autoregress src_ip AS prev_ip
+
+# 3 events ago
+| autoregress bytes p=3 AS bytes_3_ago
+
+# Range: 1 to 3 events ago
+| autoregress user p=1-3 AS user_1 user_2 user_3
 ```
 
-They do not express the same operation.
-
-The first performs:
-
-```text
-Take 10
-   ↓
-Sort those 10
-```
-
-The second performs:
-
-```text
-Sort the results
-   ↓
-Take 10
-```
-
-If the requirement is:
-
-> Give me the 10 newest matching events.
-
-the second order is the appropriate expression of that requirement.
-
-This is a general query principle:
-
-> **Command order matters.**
-
----
-
-# 4.21 SPL2: `LIMIT`
-
-SPL2 provides another way to limit rows when using the structured `FROM` syntax:
-
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-ORDER BY _time DESC
-LIMIT 10
-```
-
-Now the query reads naturally:
-
-```text
-FROM
- ↓
-WHERE
- ↓
-ORDER BY
- ↓
-LIMIT
-```
-
-The current SPL2 documentation defines `LIMIT` as a clause that sets the maximum number of rows returned.
-
----
-
-# 4.22 SPL2: `OFFSET`
-
-SPL2 also supports:
-
-```spl2
-OFFSET
-```
-
-It skips rows before returning results.
-
-For example:
-
-```spl2
-FROM windows
-ORDER BY _time DESC
-LIMIT 10
-OFFSET 20
-```
-
-Conceptually:
-
-```text
-Rows 1–20
-   ↓
-skipped
-
-Rows 21–30
-   ↓
-returned
-```
-
-This is useful for pagination [pagination: dividing a large result set into smaller sequential sections].
-
-It is not something you will need in every SOC investigation, but it is part of the current SPL2 search syntax and belongs in your fundamentals.
-
----
-
-# 4.23 `LIMIT` vs `head`
-
-The general concept is the same, but the syntax belongs to different parts of SPL2.
-
-### Traditional SPL
+#### Common Pattern: Detect Changes
 ```spl
-index=windows
-| sort -_time
-| head 10
+| sort 0 _time
+| autoregress src_ip AS prev_ip
+| eval ip_changed=if(src_ip!=prev_ip, 1, 0)
+| where ip_changed=1
 ```
-
-### SPL2 pipeline
-```spl2
-FROM windows
-| sort -_time
-| head 10
-```
-
-### SPL2 structured syntax
-```spl2
-FROM windows
-ORDER BY _time DESC
-LIMIT 10
-```
-
-This is one of the clearest examples of SPL2 giving you both a pipeline style and a structured clause style.
 
 ---
 
-# 4.24 `ORDER BY` + `LIMIT` vs `sort` + `head`
+### 4.13 `delta`: Change Between Events
 
-These forms can express the same basic intent:
+**Classification**: 🟢 DIST-STREAM
 
-```spl2
-FROM windows
-ORDER BY _time DESC
-LIMIT 10
-```
-
-and:
-
-```spl2
-FROM windows
-| sort -_time
-| head 10
-```
-
-But they belong to different syntactic models.
-
-Think:
-
-```text
-SPL-style pipeline
-    ↓
-commands connected by |
-
-SPL2 structured search
-    ↓
-FROM / WHERE / SELECT / ORDER BY / LIMIT
-```
-
-This distinction becomes increasingly important when we reach grouping and aggregation.
-
----
-
-# 4.25 A Complete Traditional SPL Example
-
-Suppose the investigation question is:
-
-> Show the 10 newest PowerShell executions.
+#### Purpose
+Numeric difference between current and previous event.
 
 ```spl
-index=windows
-| search FileName="powershell.exe"
-| fields _time host user FileName CommandLine
-| sort -_time
-| head 10
+# Time difference between events
+| sort 0 _time
+| delta _time AS time_gap
+
+# Bytes change
+| delta bytes AS byte_delta
+
+# Compare with event 2 back
+| delta _time p=2 AS gap_2_events
 ```
 
-Read it as:
-
-```text
-FIND
- ↓
-PowerShell events
-
-FIELDS
- ↓
-Useful fields
-
-SORT
- ↓
-Newest first
-
-LIMIT
- ↓
-10 events
+#### Sign Convention
 ```
+delta = current_value - previous_value (in search order)
+```
+- Ascending `_time`: positive = increasing
+- Descending `_time`: positive = decreasing
 
 ---
 
-# 4.26 A Complete SPL2 Pipeline Example
+### 4.14 `accum`: Simple Running Sum
 
-The pipeline-oriented SPL2 form is:
-
-```spl2
-FROM windows
-| where FileName="powershell.exe"
-| fields _time, host, user, FileName, CommandLine
-| sort -_time
-| head 10
-```
-
-The mental workflow is almost identical to traditional SPL.
-
----
-
-# 4.27 A Complete Structured SPL2 Example
-
-The same investigation can be written using the structured `FROM` clauses:
-
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-SELECT _time, host, user, FileName, CommandLine
-ORDER BY _time DESC
-LIMIT 10
-```
-
-Now each part has a defined role:
-
-```text
-FROM
-    What dataset?
-
-WHERE
-    Which events?
-
-SELECT
-    Which fields?
-
-ORDER BY
-    What order?
-
-LIMIT
-    How many rows?
-```
-
-This structured syntax is one of the important additions that makes SPL2 different from traditional SPL.
-
----
-
-# 4.28 Selecting Fields Does Not Filter Events
-
-Keep this distinction clear.
-
-Traditional SPL:
+**Classification**: 🟢 DIST-STREAM
 
 ```spl
-| search FileName="powershell.exe"
+| accum bytes AS total_bytes
+| accum count AS event_number
+```
+Simpler than `streamstats sum()` for single-field running totals.
+
+---
+
+### 4.15 Time Windows: `time_window` vs `window`
+
+#### Event Count Window (`window`)
+```spl
+| streamstats window=10 count AS events_last_10
+```
+**Use when**: "N events" is the rule (e.g., "5 failed logons")
+
+#### Time Window (`time_window`) — Classic SPL Only
+```spl
+| streamstats time_window=5m count AS events_last_5min
+```
+**Use when**: "N minutes" is the rule (e.g., "5 failures in 5 minutes")
+
+#### Combined
+```spl
+| streamstats window=100 time_window=5m count AS events
+# At most 100 events, within 5 minutes
 ```
 
-filters events.
+#### Ordering Requirement for `time_window`
+```spl
+# MUST sort by _time first!
+| sort 0 _time
+| streamstats time_window=5m count AS recent_failures
+```
 
-But:
+---
+
+### 4.16 Reset Logic: `reset_before`, `reset_after`, `reset_on_change`
+
+#### `reset_before` — Reset BEFORE Current Event
+```spl
+# Count failures, reset when success occurs
+# Success event starts fresh count
+| streamstats count(eval(action="failure")) AS failures
+    reset_before="(action=\"success\")"
+    BY user
+```
+Result: Success event has `failures=0`.
+
+#### `reset_after` — Reset AFTER Current Event
+```spl
+# Count failures, reset after success
+# Success event carries the failure count
+| streamstats count(eval(action="failure")) AS failures
+    reset_after="(action=\"success\")"
+    BY user
+```
+Result: Success event has `failures=N` (the count that led to success).
+
+#### `reset_on_change` — Reset When BY Field Changes
+```spl
+# Separate counter per shift, reset when shift changes
+| streamstats count BY shift reset_on_change=true
+```
+
+---
+
+### 4.17 Rolling Statistics After `timechart`
+
+Powerful pattern: aggregate to time buckets, then run rolling stats.
 
 ```spl
-| fields FileName
+index=windows EventCode=4625
+| timechart span=10m count AS failures
+| streamstats window=6 current=f avg(failures) AS baseline
+| eval anomaly_score=failures/baseline
+| where anomaly_score > 3
 ```
 
-changes which fields remain in the result.
-
-SPL2 follows the same conceptual distinction:
-
-```spl2
-WHERE FileName="powershell.exe"
-```
-
-filters events, while:
-
-```spl2
-SELECT FileName
-```
-
-selects a field for the result.
-
-Therefore:
-
-```text
-FILTER
-→ Which events?
-
-FIELD SELECTION
-→ Which fields?
-
-LIMIT
-→ How many rows?
-```
+Flow:
+1. `timechart` → 1 row per 10-min bucket
+2. `streamstats` → 6-bucket moving average (excludes current)
+3. Compare current bucket to baseline
 
 ---
 
-# 4.29 A Useful SOC Output Pattern
+### 4.18 Time Zone Handling
 
-For event-level investigations, a common pattern is:
+#### Key Principles
+1. `_time` is **always UTC** (UNIX epoch) internally
+2. Display timezone = UI/user setting
+3. Search `earliest`/`latest` = UTC unless specified
 
-### Traditional SPL
+#### Explicit Timezone in Search
 ```spl
-index=windows
-| search FileName="powershell.exe"
-| table _time host user FileName CommandLine
-| sort -_time
-| head 20
+# Search in specific timezone
+index=windows earliest=-1d@d latest=@d timezone=UTC
+index=windows earliest=-1d@d latest=@d timezone=America/New_York
 ```
 
-### SPL2 pipeline
-```spl2
-FROM windows
-| where FileName="powershell.exe"
-| fields _time, host, user, FileName, CommandLine
-| sort -_time
-| head 20
-```
-
-### SPL2 structured
-```spl2
-FROM windows
-WHERE FileName="powershell.exe"
-SELECT _time, host, user, FileName, CommandLine
-ORDER BY _time DESC
-LIMIT 20
-```
-
-This is the event-level pattern we will build on in Chapter 5.
-
----
-
-# 4.30 A New SPL2 Concept: Clause Hierarchy
-
-This belongs in the fundamentals because SPL2's structured syntax has an explicit clause order.
-
-For a normal `FROM` search, the current documentation defines the hierarchy broadly as:
-
-```text
-FROM
- ↓
-JOIN
- ↓
-WHERE
- ↓
-GROUP BY
- ↓
-SELECT
- ↓
-HAVING
- ↓
-ORDER BY
- ↓
-LIMIT
- ↓
-OFFSET
-```
-
-You do not need every clause in every search.
-
-However, when you use the structured `FROM` syntax, the clauses have to be placed in the supported order.
-
-For example:
-
-```spl2
-FROM windows
-WHERE EventCode=4625
-ORDER BY _time DESC
-LIMIT 10
-```
-
-This is not just a stylistic preference; it follows the documented SPL2 clause hierarchy.
-
-This becomes especially important when Chapter 5 introduces:
-
-```text
-GROUP BY
-SELECT aggregation
-HAVING
-ORDER BY
-LIMIT
-```
-
----
-
-# 4.31 One Important Performance Distinction
-
-Do not confuse:
-
-```text
-I only want to DISPLAY 10 rows
-```
-
-with:
-
-```text
-I only want Splunk to RETRIEVE or PROCESS 10 events.
-```
-
-Field selection and row limiting are different operations.
-
-For example:
-
+#### Timezone in `eval`
 ```spl
-index=windows
-| table _time host user
+| eval local_time=strftime(_time, "%Y-%m-%d %H:%M:%S", "America/New_York")
+| eval utc_time=strftime(_time, "%Y-%m-%d %H:%M:%S", "UTC")
 ```
 
-does not mean only 10 events were retrieved.
-
-Similarly, a search can perform earlier commands before the limiting step is reached.
-
-Splunk documents `head` as a way to limit retrieved events and recommends using a sample set when you are only testing whether a search retrieves the expected events.
-
-We will study search optimization separately instead of mixing performance tuning into this chapter.
-
----
-
-# 4.32 Common Beginner Mistakes
-
-## Mistake 1 — Thinking `table` filters events
-
+#### Common Mistake
 ```spl
-| table host user
+# WRONG: Adding hours to _time
+| eval wrong_time=_time+3600
+
+# RIGHT: Use timezone-aware formatting
+| eval correct_display=strftime(_time, "%H:%M", "America/New_York")
 ```
 
-does not decide which events survive.
-
-It decides which fields appear in the table.
-
 ---
 
-## Mistake 2 — Treating `SELECT` and `fields` as identical
+### 4.19 Complete Time Analysis Patterns
 
-They overlap, but SPL2 documents an important difference: the `SELECT` clause can remove unspecified internal fields, while `fields` has different retention behavior for internal fields.
-
-Be deliberate when `_time` and `_raw` matter.
-
----
-
-## Mistake 3 — Sorting after `head`
-
-If you need the newest 10:
-
+#### Pattern 1: Spike Detection
 ```spl
-| sort -_time
-| head 10
+index=auth action=failure
+| timechart span=5m count AS failures
+| streamstats window=12 current=f avg(failures) AS baseline, stdev(failures) AS sigma
+| eval z_score=(failures-baseline)/sigma
+| where z_score > 3
 ```
 
-not:
-
+#### Pattern 2: Beaconing (Regular Intervals)
 ```spl
-| head 10
-| sort -_time
+index=proxy
+| sort 0 _time
+| streamstats current=f delta(_time) AS interval BY src_ip,dest_ip
+| eval interval_rounded=round(interval/10)*10
+| stats count AS connections, values(interval_rounded) AS intervals BY src_ip,dest_ip
+| where mvcount(intervals)=1 AND connections > 20
 ```
 
----
-
-## Mistake 4 — Treating `LIMIT` as another spelling of `head`
-
-They can express a similar result limit, but:
-
-```spl2
-LIMIT 10
-```
-
-belongs to the structured SPL2 `FROM` syntax, whereas:
-
-```spl2
-| head 10
-```
-
-is a pipeline command.
-
----
-
-## Mistake 5 — Forgetting SPL2 comma rules for `fields`
-
-Traditional SPL commonly permits:
-
+#### Pattern 3: Session Duration
 ```spl
-| fields host user FileName
+index=web
+| transaction session_id maxpause=30m
+| eval duration=duration
+| stats avg(duration) AS avg_session, max(duration) AS max_session BY user
 ```
 
-SPL2 requires:
-
-```spl2
-| fields host, user, FileName
-```
-
----
-
-## Mistake 6 — Assuming numeric-looking strings sort numerically
-
-A field containing the string `443` is not automatically the same as a numeric field containing `443` for sorting purposes.
-
-Know the data type when order matters.
-
----
-
-# 4.33 What You Should Remember
-
-If you remember only these ideas:
-
-```text
-FILTER
-→ Which events?
-
-TABLE / FIELDS / SELECT
-→ Which fields?
-
-RENAME / AS
-→ What should the fields be called?
-
-SORT / ORDER BY
-→ What order?
-
-HEAD / LIMIT
-→ How many?
-```
-
-And remember the three main forms:
-
-### Traditional SPL
+#### Pattern 4: First/Last Activity
 ```spl
-index=windows
-| search ...
-| fields ...
-| sort -_time
-| head 10
-```
-
-### SPL2 pipeline
-```spl2
-FROM windows
-| where ...
-| fields ...
-| sort -_time
-| head 10
-```
-
-### SPL2 structured
-```spl2
-FROM windows
-WHERE ...
-SELECT ...
-ORDER BY _time DESC
-LIMIT 10
-```
-
-Do not learn SPL2 as a simple replacement dictionary for SPL. SPL2 adds a structured clause model that becomes increasingly useful as your searches move into grouping and aggregation.
-
----
-
-# 4.34 Chapter Summary
-
-In this chapter, we moved from finding events to shaping the results.
-
-We learned the major result-shaping tools in both languages.
-
-### Traditional SPL
-
-```text
-table
-fields
-rename
-sort
-head
-```
-
-### SPL2
-
-```text
-SELECT
-SELECT DISTINCT
-fields
-rename / AS
-ORDER BY
-sort
-LIMIT
-OFFSET
-head
-```
-
-We also learned that:
-
-- `table` is useful for focused tabular output.
-- `fields` keeps or removes fields.
-- `SELECT` performs structured field/expression selection in SPL2.
-- `SELECT` can remove unspecified internal fields, so `_time` and `_raw` must be included when needed.
-- `rename` changes field names in the result.
-- `AS` can create clearer field names, especially with SPL2 `SELECT`.
-- `sort` controls order in a pipeline.
-- `ORDER BY` controls order in the structured SPL2 syntax.
-- `head` limits pipeline results.
-- `LIMIT` limits rows in structured SPL2 syntax.
-- `OFFSET` skips rows and is useful for pagination.
-- `SELECT DISTINCT` returns unique combinations of selected values.
-- Sorting before limiting matters when the requirement is "newest N" or "largest N".
-- Lexicographical ordering can differ from numerical ordering.
-- Field selection and event filtering are different operations.
-- The SPL2 `FROM` clause has a documented hierarchy that will matter when we introduce aggregation.
-
-The central workflow is:
-
-```text
-FIND
- ↓
-FILTER
- ↓
-SELECT FIELDS
- ↓
-RENAME
- ↓
-SORT
- ↓
-LIMIT
+index=auth
+| stats earliest(_time) AS first_seen, latest(_time) AS last_seen BY user
+| eval tenure=last_seen-first_seen
 ```
 
 ---
 
-# 4.35 Official Splunk Documentation
+### 4.20 What's Next
 
-This chapter follows the current official Splunk documentation for:
-
-- SPL2 `FROM` syntax and clause hierarchy
-- SPL2 `SELECT` and `SELECT DISTINCT`
-- SPL2 `fields`
-- SPL2 `ORDER BY`
-- SPL2 `LIMIT`
-- SPL2 `OFFSET`
-- SPL2 `head`
-- SPL2 `rename` and `AS`
-- Traditional SPL `table`
-- Traditional SPL `fields`
-- Traditional SPL `sort`
-- Traditional SPL `head`
-
-The current Splunk documentation should take precedence over older tutorials when syntax differs between releases.
-
-# Chapter 5
-
-**Grouping and Aggregation**
-
-Next we move from:
-
-```text
-individual events
-```
-
-to:
-
-```text
-counts
-statistics
-frequencies
-grouped results
-```
-
-with:
-
-```text
-SPL
-stats
-chart
-timechart
-
-SPL2
-GROUP BY
-SELECT count(), sum(), avg(), ...
-HAVING
-```
+- **Chapter 5**: Sequence & Correlation Analysis — detection patterns using streaming commands
+- **Chapter 6**: Edge/Ingest Processor Pipeline Design + Custom Commands
+- **Chapter 7**: Performance, SOC Patterns & Reference
